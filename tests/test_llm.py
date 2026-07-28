@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 from nooa.unifiedllm import LLMResponse, Tool, UnifiedLLM
 from pydantic import BaseModel
 
-from nooa_coding.llm import FailoverLLM
+from nooa_coding.config import ModelEndpoint
+from nooa_coding.llm import FailoverLLM, build_llm
 
 
 class StubLLM(UnifiedLLM):
@@ -67,3 +69,31 @@ async def test_model_failover_reports_aggregate_failure() -> None:
     )
     with pytest.raises(RuntimeError, match="all configured models failed"):
         await llm.acall([])
+
+
+def test_build_llm_uses_plaintext_api_key() -> None:
+    endpoint = ModelEndpoint(name="anthropic/claude-sonnet-4-5", api_key="sk-ant-secret")
+    with patch("nooa_coding.llm.get_llm_client") as mock_get:
+        mock_get.return_value = StubLLM("anthropic/claude-sonnet-4-5")
+        build_llm((endpoint,))
+    mock_get.assert_called_once_with(
+        "anthropic/claude-sonnet-4-5", client_type=None, api_key="sk-ant-secret"
+    )
+
+
+def test_build_llm_api_key_takes_priority_over_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TEST_KEY_ENV", "from-env")
+    endpoint = ModelEndpoint(name="openai/gpt-5", api_key="inline-key", api_key_env="TEST_KEY_ENV")
+    with patch("nooa_coding.llm.get_llm_client") as mock_get:
+        mock_get.return_value = StubLLM("openai/gpt-5")
+        build_llm((endpoint,))
+    mock_get.assert_called_once_with("openai/gpt-5", client_type=None, api_key="inline-key")
+
+
+def test_build_llm_falls_back_to_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MY_KEY", "env-secret")
+    endpoint = ModelEndpoint(name="openai/gpt-5", api_key_env="MY_KEY")
+    with patch("nooa_coding.llm.get_llm_client") as mock_get:
+        mock_get.return_value = StubLLM("openai/gpt-5")
+        build_llm((endpoint,))
+    mock_get.assert_called_once_with("openai/gpt-5", client_type=None, api_key="env-secret")

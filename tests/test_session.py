@@ -5,7 +5,8 @@ import json
 from pathlib import Path
 
 import pytest
-from conftest import coding_response, fake_llm
+from conftest import coding_response, fake_llm, response_with_code
+from nooa.agentdoc import doc
 from nooa.events import Message, Summary
 from nooa.unifiedllm import FakeLLMClient, LLMResponse
 
@@ -39,6 +40,61 @@ async def test_session_runs_in_worktree_streams_replays_and_resumes(
         assert resumed.agent.last_result.status == "completed"
     finally:
         await resumed.close()
+
+
+@pytest.mark.asyncio
+async def test_model_identity_comes_from_live_session_without_an_llm_call(
+    git_repo: Path, settings
+) -> None:
+    manager = AgentSessionManager(git_repo, settings)
+    session = manager.create("identity", llm=FakeLLMClient(scripted_responses=[]))
+    try:
+        result = await session.prompt("你是什么模型呢？")
+        assert result.mode == "conversation"
+        assert result.status == "answered"
+        assert result.model == session.current_model
+        assert session.current_model in result.summary
+        assert all(event.name != "LLMComplete" for event in session.replay())
+        agent_api = doc(session.agent)
+        assert "notify" in agent_api
+        assert "message(" not in agent_api
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_repository_question_routes_to_read_only_inspection(git_repo: Path, settings) -> None:
+    response = response_with_code(
+        "return_result(InspectionDraft(status='completed', "
+        "summary='The function can be simplified.', "
+        "evidence='README.md was inspected.'))"
+    )
+    manager = AgentSessionManager(git_repo, settings)
+    session = manager.create("inspect", llm=fake_llm(response))
+    try:
+        result = await session.prompt("这个函数应该怎么优化？")
+        assert result.mode == "inspect"
+        assert result.status == "inspected"
+        assert result.changed_files == []
+        assert session.diff().status == ""
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_change_completion_requires_a_new_host_observed_change(
+    git_repo: Path, settings
+) -> None:
+    manager = AgentSessionManager(git_repo, settings)
+    session = manager.create("host-evidence", llm=fake_llm(coding_response(write_file=False)))
+    (session.workspace / "preexisting.txt").write_text("already here\n", encoding="utf-8")
+    try:
+        result = await session.prompt("implement the requested change")
+        assert result.status == "verification_failed"
+        assert result.changed_files == ["preexisting.txt"]
+        assert "no new worktree change" in result.evidence
+    finally:
+        await session.close()
 
 
 @pytest.mark.asyncio

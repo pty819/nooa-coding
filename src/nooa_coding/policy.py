@@ -8,6 +8,7 @@ import re
 import shlex
 import uuid
 from collections.abc import Callable
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
@@ -111,7 +112,40 @@ class PermissionPolicy:
             "The agent wants to create or modify this file.",
         )
 
-    async def shell(self, command: str) -> None:
+    @staticmethod
+    def read_only_shell_allowed(command: str) -> bool:
+        """Allow only commands whose syntax cannot intentionally mutate the worktree."""
+        normalized = " ".join(command.strip().split())
+        if re.search(r"(?:&&|\|\||[;\n|<>`]|\$\()", normalized):
+            return False
+        try:
+            tokens = shlex.split(normalized)
+        except ValueError:
+            return False
+        if not tokens:
+            return False
+        if any(
+            token.startswith("/") or ".." in Path(token).parts
+            for token in tokens[1:]
+            if not token.startswith("-")
+        ):
+            return False
+        if tokens[0] in {"pwd", "ls"}:
+            return True
+        if tokens[0] == "rg":
+            return not any(token.startswith("--pre") for token in tokens[1:])
+        if tokens[0] == "find":
+            mutating = {"-delete", "-exec", "-execdir", "-fprint", "-fprint0", "-ok", "-okdir"}
+            return not any(token in mutating for token in tokens[1:])
+        if tokens[0] == "git" and len(tokens) >= 2:
+            if tokens[1] not in {"diff", "log", "show", "status"}:
+                return False
+            dangerous = ("--ext-diff", "--output", "--exec-path")
+            return not any(token.startswith(dangerous) for token in tokens[2:])
+        return False
+
+    def shell_mode(self, command: str) -> PermissionMode:
+        """Classify a command without triggering an approval request."""
         normalized = " ".join(command.strip().split())
         segments = [part.strip() for part in re.split(r"(?:&&|\|\||[;\n|])", normalized)]
         if any(
@@ -119,7 +153,7 @@ class PermissionPolicy:
             for pattern in self.settings.deny_shell
             for candidate in (normalized, *segments)
         ):
-            raise PermissionError(f"policy denies shell command: {command}")
+            return "deny"
         has_shell_control = bool(re.search(r"(?:&&|\|\||[;\n|<>`]|\$\()", normalized))
         try:
             tokens = shlex.split(normalized)
@@ -137,9 +171,15 @@ class PermissionPolicy:
                 fnmatch.fnmatchcase(normalized, pattern) for pattern in self.settings.allow_shell
             )
         ):
-            return
+            return "allow"
+        return self.settings.shell
+
+    async def shell(self, command: str) -> None:
+        mode = self.shell_mode(command)
+        if mode == "deny":
+            raise PermissionError(f"policy denies shell command: {command}")
         await self._enforce_mode(
-            self.settings.shell,
+            mode,
             self.approvals,
             "shell",
             command,
@@ -163,6 +203,7 @@ class PolicyShellTools(Skill):
         self._limits = limits
         self._event_sink = event_sink
         self._operation_lock = asyncio.Lock()
+        self._read_only_depth = 0
         super().__init__()
 
     @property
@@ -172,6 +213,16 @@ class PolicyShellTools(Skill):
     @hidden
     async def close(self) -> None:
         await self._shell.close()
+
+    @hidden
+    @asynccontextmanager
+    async def _read_only_scope(self):
+        """Prevent a repository-inspection turn from crossing into mutation."""
+        self._read_only_depth += 1
+        try:
+            yield
+        finally:
+            self._read_only_depth -= 1
 
     async def run(
         self,
@@ -183,6 +234,10 @@ class PolicyShellTools(Skill):
         """Run a policy-approved command inside the isolated worktree."""
         if stdin is not None and len(stdin) > self._limits.max_stdin_chars:
             raise ValueError("stdin exceeds configured max_stdin_chars")
+        if self._read_only_depth and not self._policy.read_only_shell_allowed(command):
+            raise PermissionError(
+                "inspection mode only permits configured read-only shell commands"
+            )
         await self._policy.shell(command)
         effective_timeout = min(
             timeout or self._limits.command_timeout, self._limits.command_timeout
@@ -194,7 +249,12 @@ class PolicyShellTools(Skill):
         """Run an application-configured verification command without prompting."""
         effective_timeout = min(timeout, self._limits.verification_timeout)
         async with self._operation_lock:
-            return await self._execute(command, stdin=None, timeout=effective_timeout)
+            return await self._execute(
+                command,
+                stdin=None,
+                timeout=effective_timeout,
+                announce=False,
+            )
 
     async def _execute(
         self,
@@ -202,8 +262,10 @@ class PolicyShellTools(Skill):
         *,
         stdin: str | None,
         timeout: float,
+        announce: bool = True,
     ) -> ShellResult:
-        self._event_sink("command_started", {"command": command, "timeout": timeout})
+        if announce:
+            self._event_sink("command_started", {"command": command, "timeout": timeout})
         try:
             result = await self._shell.run(command, stdin=stdin, timeout=timeout)
         finally:
@@ -216,15 +278,16 @@ class PolicyShellTools(Skill):
         if len(stderr) > self._limits.max_output_chars:
             stderr = stderr[: self._limits.max_output_chars] + "\n... (stderr truncated)"
         limited = ShellResult(stdout, stderr, result.returncode, matches=result.matches)
-        self._event_sink(
-            "command_finished",
-            {
-                "command": command,
-                "returncode": limited.returncode,
-                "stdout": limited.stdout,
-                "stderr": limited.stderr,
-            },
-        )
+        if announce:
+            self._event_sink(
+                "command_finished",
+                {
+                    "command": command,
+                    "returncode": limited.returncode,
+                    "stdout": limited.stdout,
+                    "stderr": limited.stderr,
+                },
+            )
         return limited
 
     async def read(
@@ -245,6 +308,8 @@ class PolicyShellTools(Skill):
     ) -> FileWrite:
         """Edit a file after host approval."""
         path = target.path if isinstance(target, Match) else str(target)
+        if self._read_only_depth:
+            raise PermissionError("inspection mode cannot modify files")
         await self._policy.file_write(path)
         async with self._operation_lock:
             result = await self._shell.replace(target, old_or_new, new)
@@ -259,6 +324,8 @@ class PolicyShellTools(Skill):
         """Create or overwrite a file after host approval."""
         if len(content) > self._limits.max_stdin_chars:
             raise ValueError("file content exceeds configured max_stdin_chars")
+        if self._read_only_depth:
+            raise PermissionError("inspection mode cannot modify files")
         await self._policy.file_write(path)
         async with self._operation_lock:
             result = await self._shell.write_file(path, content)

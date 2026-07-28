@@ -25,6 +25,7 @@ from .resources import install_resources, load_agents_context
 
 with hidden:
     import ast
+    import hashlib
 
 if TYPE_CHECKING:
     from nooa.storage.manager import StorageManager
@@ -40,6 +41,22 @@ class CodingTaskDraft(BaseModel):
     suggested_verification: str = ""
 
 
+class InspectionDraft(BaseModel):
+    status: Literal["completed", "blocked"]
+    summary: str
+    evidence: str
+    root_cause: str = "not applicable"
+
+
+class ConversationDraft(BaseModel):
+    answer: str
+
+
+class RequestRoute(BaseModel):
+    mode: Literal["conversation", "inspect", "change"]
+    reason: str
+
+
 class VerificationResult(BaseModel):
     command: str
     passed: bool
@@ -49,12 +66,14 @@ class VerificationResult(BaseModel):
 
 
 class CodingTaskResult(BaseModel):
-    status: Literal["completed", "verification_failed", "blocked"]
+    mode: Literal["conversation", "inspect", "change"] = "change"
+    status: Literal["answered", "inspected", "completed", "verification_failed", "blocked"]
     summary: str
-    root_cause: str
-    changed_files: list[str]
-    evidence: str
+    root_cause: str = "not applicable"
+    changed_files: list[str] = Field(default_factory=list)
+    evidence: str = ""
     verifications: list[VerificationResult] = Field(default_factory=list)
+    model: str = ""
 
 
 _CODEACT_CONFIG = CodeActConfig(
@@ -111,11 +130,15 @@ def _cell_policy_violation(code: str) -> str | None:
             if node.attr in blocked_file_methods:
                 return f"direct file method {node.attr!r} is blocked; use self.shell"
             current: ast.AST = node
+            attributes: list[str] = []
             while isinstance(current, ast.Attribute):
-                if current.attr.startswith("_"):
-                    return "private runtime attributes are blocked in generated code"
+                attributes.append(current.attr)
                 current = current.value
-            if isinstance(current, ast.Name) and current.id == "self" and node.attr.startswith("_"):
+            if (
+                isinstance(current, ast.Name)
+                and current.id == "self"
+                and any(value.startswith("_") for value in attributes)
+            ):
                 return "private agent attributes are blocked in generated code"
     return None
 
@@ -227,52 +250,306 @@ class CodingAgent(MemoryToolsMixin, InteractiveAgent):
         await self.shell.close()
 
     @hidden
+    def message(self, text: str, *, echo: bool = False) -> None:
+        """Keep the inherited synchronous primitive out of the generated API."""
+        super().message(text, echo=echo)
+
+    async def notify(self, text: str) -> None:
+        """Send a concise progress update to the user. This method is asynchronous."""
+        self.message(text)
+
+    def _current_model(self) -> str:
+        active = getattr(self.llm, "active", self.llm)
+        return str(getattr(active, "model", getattr(self.llm, "model", "unknown")))
+
+    def _local_answer(self, task: str) -> str | None:
+        normalized = " ".join(task.lower().split())
+        if any(
+            marker in normalized
+            for marker in (
+                "什么模型",
+                "哪个模型",
+                "模型是什么",
+                "which model",
+                "what model",
+                "model are you",
+                "model is this",
+            )
+        ):
+            return f"当前会话实际使用的模型是 `{self._current_model()}`。"
+        if normalized in {"你是谁", "你是什么", "who are you", "what are you"}:
+            return (
+                "我是 NOOA Coding Agent：在隔离的 Git worktree 中审阅、修改并验证代码。"
+                f"当前模型是 `{self._current_model()}`。"
+            )
+        if any(marker in normalized for marker in ("你能做什么", "有什么能力", "capabilities")):
+            return (
+                "我可以解释和审阅仓库、定位问题、实施代码改动、运行验证，并通过审批门控制高风险操作。"
+                "审阅任务默认只读，改动任务会在隔离 worktree 中执行。"
+            )
+        if normalized in {"你好", "hi", "hello", "hey"}:
+            return "你好。我可以先只读分析仓库，也可以在隔离 worktree 中实现并验证一个具体改动。"
+        return None
+
+    @staticmethod
+    def _obvious_route(task: str) -> Literal["conversation", "inspect", "change"] | None:
+        normalized = task.lower()
+        question_form = normalized.rstrip().endswith(("?", "？")) or any(
+            marker in normalized for marker in ("如何", "怎么", "怎样", "how ")
+        )
+        explicit_action = any(
+            marker in normalized for marker in ("帮我", "请", "直接", "can you", "please")
+        )
+        repository_terms = (
+            "代码",
+            "函数",
+            "类",
+            "仓库",
+            "项目",
+            "模块",
+            "测试",
+            "报错",
+            "文件",
+            "code",
+            "function",
+            "class",
+            "repo",
+            "module",
+            "test",
+            "error",
+        )
+        if (
+            question_form
+            and not explicit_action
+            and any(marker in normalized for marker in repository_terms)
+        ):
+            return "inspect"
+        change_markers = (
+            "修复",
+            "修改",
+            "实现",
+            "添加",
+            "新增",
+            "删除",
+            "重构",
+            "优化",
+            "升级",
+            "接入",
+            "改成",
+            "fix ",
+            "implement",
+            "add ",
+            "create ",
+            "write ",
+            "change ",
+            "update ",
+            "refactor",
+            "remove ",
+        )
+        if any(marker in normalized for marker in change_markers):
+            return "change"
+        inspect_markers = (
+            "审阅",
+            "分析",
+            "解释",
+            "排查",
+            "检查",
+            "评估",
+            "理解",
+            "为什么",
+            "是什么原因",
+            "review",
+            "analyze",
+            "explain",
+            "inspect",
+            "investigate",
+            "diagnose",
+        )
+        if any(marker in normalized for marker in inspect_markers):
+            return "inspect"
+        if normalized.rstrip().endswith(("?", "？")):
+            return "conversation"
+        return None
+
+    async def _route_request(self, task: str) -> Literal["conversation", "inspect", "change"]:
+        obvious = self._obvious_route(task)
+        if obvious is not None:
+            return obvious
+        return (await self._classify_request(task)).mode
+
+    @staticmethod
+    def _paths_from_status(status: str) -> list[str]:
+        paths: list[str] = []
+        records = status.split("\0")
+        index = 0
+        while index < len(records):
+            record = records[index]
+            if len(record) < 4:
+                index += 1
+                continue
+            paths.append(record[3:])
+            renamed_or_copied = "R" in record[:2] or "C" in record[:2]
+            index += 2 if renamed_or_copied else 1
+        return paths
+
+    def _untracked_signature(self, status: str) -> str:
+        digest = hashlib.sha256()
+        remaining_bytes = 50_000_000
+        for record in status.split("\0"):
+            if not record.startswith("?? "):
+                continue
+            relative = record[3:]
+            candidate = self._repo_root / relative
+            digest.update(relative.encode(errors="surrogateescape"))
+            try:
+                metadata = candidate.lstat()
+                digest.update(f":{metadata.st_mode}:{metadata.st_size}:".encode())
+                if candidate.is_symlink():
+                    digest.update(str(candidate.readlink()).encode(errors="surrogateescape"))
+                elif candidate.is_file() and metadata.st_size <= remaining_bytes:
+                    with candidate.open("rb") as stream:
+                        while chunk := stream.read(1_048_576):
+                            digest.update(chunk)
+                    remaining_bytes -= metadata.st_size
+                else:
+                    digest.update(str(metadata.st_mtime_ns).encode())
+            except OSError as exc:
+                digest.update(f"unavailable:{type(exc).__name__}".encode())
+        return digest.hexdigest()
+
+    async def _worktree_state(self) -> tuple[str, str, str, str]:
+        """Capture enough host state to prove that this turn actually changed the worktree."""
+        head = await self.shell._run_trusted("git rev-parse HEAD", timeout=15)
+        status = await self.shell._run_trusted(
+            "git status --porcelain=v1 -z --untracked-files=all", timeout=15
+        )
+        diff_hash = await self.shell._run_trusted(
+            "git diff --binary --no-ext-diff HEAD | git hash-object --stdin",
+            timeout=30,
+        )
+        return (
+            head.stdout,
+            status.stdout,
+            diff_hash.stdout,
+            self._untracked_signature(status.stdout),
+        )
+
+    @hidden
     async def run_task(self, description: str, *, continued: bool = False) -> CodingTaskResult:
-        """Run one model task, then enforce host-configured verification."""
+        """Route one request and enforce mode-specific host policy and verification."""
         task = description.strip()
         if not task:
             raise ValueError("task must be non-empty")
         self.task = task
+        model = self._current_model()
+        local_answer = self._local_answer(task)
+        if local_answer is not None:
+            result = CodingTaskResult(
+                mode="conversation",
+                status="answered",
+                summary=local_answer,
+                evidence="Answered from live host session configuration.",
+                model=model,
+            )
+            self.last_result = result
+            return result
+
+        mode = await self._route_request(task)
         if not continued:
             self.todo.clear()
+        if mode == "conversation":
+            draft = await self._answer_question(task)
+            result = CodingTaskResult(
+                mode=mode,
+                status="answered",
+                summary=draft.answer,
+                evidence="Generated without repository mutation tools.",
+                model=model,
+            )
+            self.last_result = result
+            return result
+
         if not self.todo.list_todos():
             self.todo.add("Inspect the repository and establish concrete evidence")
+        if mode == "inspect":
+            async with self.shell._read_only_scope():
+                inspection = await self._inspect_repository(task)
+            result = CodingTaskResult(
+                mode=mode,
+                status="inspected" if inspection.status == "completed" else "blocked",
+                summary=inspection.summary,
+                root_cause=inspection.root_cause,
+                evidence=inspection.evidence,
+                model=model,
+            )
+            self.last_result = result
+            return result
 
-        draft = await self._solve_task(task)
+        state_before = await self._worktree_state()
+        draft = await self._implement_change(task)
+        state_after = await self._worktree_state()
+        changed_files = self._paths_from_status(state_after[1])
         verifications: list[VerificationResult] = []
         status: Literal["completed", "verification_failed", "blocked"] = draft.status
         if draft.status == "completed":
-            commands = list(self._settings.verification_commands)
-            if not commands and draft.suggested_verification.strip():
-                commands = [draft.suggested_verification.strip()]
-            if not commands:
+            if not changed_files or state_before == state_after:
                 status = "verification_failed"
-                draft.evidence += "\nNo verification command was configured or suggested."
-            for command in commands:
-                result = await self.shell._run_trusted(
-                    command,
-                    timeout=self._settings.limits.verification_timeout,
+                draft.evidence += "\nThe host found no new worktree change produced by this turn."
+            configured = list(self._settings.verification_commands)
+            suggested = draft.suggested_verification.strip()
+            commands = ["git diff --check", *configured]
+            if not configured and suggested:
+                commands.append(suggested)
+            if not configured and not suggested:
+                status = "verification_failed"
+                draft.evidence += (
+                    "\nNo behavioral verification command was configured or suggested."
                 )
+            for index, command in enumerate(commands):
+                try:
+                    if index == 0 or command in configured:
+                        shell_result = await self.shell._run_trusted(
+                            command,
+                            timeout=self._settings.limits.verification_timeout,
+                        )
+                    else:
+                        shell_result = await self.shell.run(
+                            command,
+                            timeout=self._settings.limits.verification_timeout,
+                        )
+                except PermissionError as exc:
+                    verifications.append(
+                        VerificationResult(
+                            command=command,
+                            passed=False,
+                            returncode=126,
+                            stderr=str(exc),
+                        )
+                    )
+                    status = "verification_failed"
+                    break
                 verifications.append(
                     VerificationResult(
                         command=command,
-                        passed=result.success,
-                        returncode=result.returncode,
-                        stdout=result.stdout[-8_000:],
-                        stderr=result.stderr[-8_000:],
+                        passed=shell_result.success,
+                        returncode=shell_result.returncode,
+                        stdout=shell_result.stdout[-8_000:],
+                        stderr=shell_result.stderr[-8_000:],
                     )
                 )
-                if not result.success:
+                if not shell_result.success:
                     status = "verification_failed"
                     break
 
         result = CodingTaskResult(
+            mode="change",
             status=status,
             summary=draft.summary,
             root_cause=draft.root_cause,
-            changed_files=draft.changed_files,
+            changed_files=changed_files,
             evidence=draft.evidence,
             verifications=verifications,
+            model=model,
         )
         self.last_result = result
         return result
@@ -286,8 +563,12 @@ class CodingAgent(MemoryToolsMixin, InteractiveAgent):
                 kind=RespondReason.NEED_INPUT, explanation="waiting for a coding request"
             )
         result = await self.run_task("\n".join(messages), continued=bool(self.task))
-        self.message(result.model_dump_json(indent=2))
-        reason = RespondReason.DONE if result.status == "completed" else RespondReason.NEED_INPUT
+        self.message(result.summary)
+        reason = (
+            RespondReason.DONE
+            if result.status in {"answered", "inspected", "completed"}
+            else RespondReason.NEED_INPUT
+        )
         return RespondResult(kind=reason, explanation=f"coding task ended with {result.status}")
 
     @hidden
@@ -307,16 +588,36 @@ class CodingAgent(MemoryToolsMixin, InteractiveAgent):
         """Preserve decisions, evidence, modifications, open work, and identifiers from history."""
         ...
 
+    @strategy(PredictStrategy(config=PredictConfig(max_param_chars=20_000)))
+    async def _classify_request(self, request: str) -> RequestRoute:
+        """Classify one request as conversation, read-only repository inspection, or code change."""
+        ...
+
+    @strategy(PredictStrategy(config=PredictConfig(max_param_chars=100_000)))
+    async def _answer_question(self, question: str) -> ConversationDraft:
+        """Answer a non-repository conversational question concisely and honestly."""
+        ...
+
     @strategy(CodeActStrategy(config=_CODEACT_CONFIG))
-    async def _solve_task(self, description: str) -> CodingTaskDraft:
-        """Solve one coding task in the isolated repository worktree.
+    async def _inspect_repository(self, request: str) -> InspectionDraft:
+        """Investigate one repository question without modifying files.
+
+        Establish evidence with policy-controlled read and shell tools. Cite concrete
+        paths, symbols, and command output. Use `await self.notify(...)` for only
+        meaningful progress. Return `blocked` if evidence cannot be obtained.
+        """
+        ...
+
+    @strategy(CodeActStrategy(config=_CODEACT_CONFIG))
+    async def _implement_change(self, request: str) -> CodingTaskDraft:
+        """Implement one code change in the isolated repository worktree.
 
         Inspect before editing and preserve unrelated work. Use the supplied
         policy-controlled shell and repository tools. Keep the todo list current.
         Run focused checks while implementing. The deterministic host will run
         configured final verification after this method returns.
 
-        Use `self.message(...)` for useful progress visible to the user. Use
+        Use `await self.notify(...)` for concise, useful progress. Use
         `self.recall(...)` before work and store only verified, durable knowledge
         with `self.remember(...)`. Reload instructions if the repository changes
         them. Never claim completion without concrete command output.
@@ -330,5 +631,8 @@ __all__ = [
     "CodingAgent",
     "CodingTaskDraft",
     "CodingTaskResult",
+    "ConversationDraft",
+    "InspectionDraft",
+    "RequestRoute",
     "VerificationResult",
 ]

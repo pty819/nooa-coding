@@ -29,6 +29,23 @@ Before and after every prompt, the agent snapshot is saved. Metadata is marked
 that state, restores the latest snapshot, preserves the worktree, and records a
 crash-recovery event.
 
+## Turn routing and completion authority
+
+The application routes each request before giving it tools:
+
+- conversation: no repository tools; host-known questions such as the active
+  model are answered directly from live session state;
+- inspection: read-only file access and a strict allowlist of non-mutating shell
+  commands;
+- change: policy-controlled editing followed by host verification.
+
+Generation methods investigate or implement one task. A deterministic Python
+orchestrator owns the workflow and final status. For change turns it compares
+the worktree before and after model execution, derives changed paths from Git,
+runs `git diff --check`, and then runs configured or policy-approved behavioral
+checks. A model-authored claim or file list cannot by itself produce a
+`completed` result.
+
 ## State separation
 
 - `session.db`: NOOA events and snapshots for one conversation.
@@ -49,5 +66,10 @@ after a client still fails, `FailoverLLM` tries the next configured model and
 emits `model_failover`. Shell commands have bounded duration, stdin, and retained
 output. Active turns are cancellable, and cancellation also releases pending
 approval futures before persisting a final snapshot.
+
+The terminal renderer intentionally hides internal lifecycle chatter while the
+durable event stream retains it for replay and future clients. Rich output is
+written through prompt-toolkit in raw VT100 mode, and provider-supplied ANSI
+control sequences are stripped before Markdown rendering.
 
 This project deliberately has no service/database/multi-tenant layer.

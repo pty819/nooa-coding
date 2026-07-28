@@ -65,7 +65,26 @@ def test_generated_cells_must_use_policy_controlled_tools() -> None:
     assert _cell_policy_violation("Path('outside.txt').write_text('x')") is not None
     assert _cell_policy_violation("await self.shell._shell.run('whoami')") is not None
     assert _cell_policy_violation("await self.shell.write_file('safe.txt', 'x')") is None
+    assert _cell_policy_violation("return_result(_call.return_type(summary='ok'))") is None
     assert _cell_policy_violation("'a'.replace('a', 'b')") is None
+
+
+@pytest.mark.asyncio
+async def test_inspection_scope_blocks_file_and_shell_mutation(tmp_path: Path) -> None:
+    approvals = ApprovalManager(lambda *_: None)
+    policy = PermissionPolicy(PermissionSettings(file_write="allow", shell="allow"), approvals)
+    shell = PolicyShellTools(tmp_path, policy, LimitSettings(), lambda *_: None)
+    try:
+        async with shell._read_only_scope():
+            with pytest.raises(PermissionError, match="inspection mode"):
+                await shell.write_file("blocked.txt", "no\n")
+            with pytest.raises(PermissionError, match="read-only shell"):
+                await shell.run('python3 -c \'open("blocked.txt", "w").write("no")\'')
+            result = await shell.run("pwd")
+            assert result.success
+    finally:
+        await shell.close()
+    assert not (tmp_path / "blocked.txt").exists()
 
 
 @pytest.mark.asyncio

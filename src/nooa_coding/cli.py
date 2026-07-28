@@ -11,14 +11,16 @@ import click
 from prompt_toolkit import PromptSession
 from prompt_toolkit.patch_stdout import patch_stdout
 from rich.console import Console
-from rich.markdown import Markdown
 from rich.syntax import Syntax
+from rich.text import Text
 
 from .config import ModelEndpoint, load_settings
 from .events import SessionEvent
 from .session import AgentSession, AgentSessionManager
+from .terminal import TerminalRenderer
 
 console = Console()
+renderer = TerminalRenderer(console)
 
 
 async def _next_event(stream: object) -> SessionEvent:
@@ -26,36 +28,16 @@ async def _next_event(stream: object) -> SessionEvent:
 
 
 def _render_event(event: SessionEvent) -> None:
-    if event.kind == "message":
-        content = event.data.get("content")
-        if content:
-            console.print(Markdown(str(content)))
-    elif event.name == "approval_requested":
-        console.print(
-            f"[yellow]Approval required[/yellow] {event.data['request_id']} "
-            f"({event.data['kind']}): {event.data['resource']}"
-        )
-        console.print(
-            f"Use /approve {event.data['request_id']} or /deny {event.data['request_id']}"
-        )
-    elif event.name == "command_started":
-        console.print(f"[cyan]$ {event.data.get('command', '')}[/cyan]")
-    elif event.name == "command_finished":
-        code = event.data.get("returncode")
-        console.print(f"[dim]command exited {code}[/dim]")
-    elif event.kind in {"error", "model_failover"}:
-        console.print(f"[red]{event.name}[/red]: {json.dumps(event.data, ensure_ascii=False)}")
-    elif event.kind in {"session", "checkpoint"}:
-        console.print(f"[dim]{event.name}[/dim]")
+    renderer.event(event)
 
 
-async def _run_turn(
+async def _run_single_turn(
     session: AgentSession,
     text: str,
     prompt: PromptSession[str],
     *,
     allow_controls: bool,
-) -> None:
+) -> list[str]:
     cursor = session.replay()[-1].sequence if session.replay() else 0
     turn = session.start(text)
     stream = session.stream(after_sequence=cursor)
@@ -68,7 +50,9 @@ async def _run_turn(
     pending_followups: list[str] = []
     try:
         while not turn.done():
-            waiters: set[asyncio.Task[object]] = {turn, event_task}  # type: ignore[arg-type]
+            waiters: set[asyncio.Task[object]] = {turn}  # type: ignore[arg-type]
+            if event_task is not None:
+                waiters.add(event_task)  # type: ignore[arg-type]
             if control_task is not None:
                 waiters.add(control_task)  # type: ignore[arg-type]
             done, _ = await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
@@ -80,18 +64,31 @@ async def _run_turn(
                 else:
                     cursor = event.sequence
                     _render_event(event)
-                event_task = asyncio.create_task(_next_event(stream))
+                    event_task = asyncio.create_task(_next_event(stream))
             if control_task is not None and control_task in done:
                 command = control_task.result().strip()
                 if command == "/cancel":
                     await session.cancel()
+                elif command.lower() in {"y", "yes", "n", "no"}:
+                    pending = session.approvals.pending()
+                    if len(pending) != 1:
+                        console.print(
+                            Text(
+                                "Use /approve ID or /deny ID when approval is ambiguous.",
+                                style="yellow",
+                            )
+                        )
+                    elif command.lower() in {"y", "yes"}:
+                        session.approve(pending[0].request_id)
+                    else:
+                        session.deny(pending[0].request_id)
                 elif command.startswith("/approve "):
                     session.approve(command.split(maxsplit=1)[1])
                 elif command.startswith("/deny "):
                     session.deny(command.split(maxsplit=1)[1])
                 elif command:
                     pending_followups.append(command)
-                    console.print("[dim]Follow-up queued for the next turn.[/dim]")
+                    console.print(Text("Follow-up queued for the next turn.", style="dim"))
                 if not turn.done():
                     control_task = asyncio.create_task(
                         prompt.prompt_async("[running: /cancel, /approve ID, /deny ID] > ")
@@ -99,9 +96,9 @@ async def _run_turn(
         try:
             result = await turn
         except asyncio.CancelledError:
-            console.print("[yellow]Turn cancelled.[/yellow]")
+            console.print(Text("Turn cancelled.", style="yellow"))
         else:
-            console.print_json(result.model_dump_json())
+            renderer.result(result)
     finally:
         for task in (event_task, control_task):
             if task is not None and not task.done():
@@ -109,38 +106,32 @@ async def _run_turn(
                 with suppress(asyncio.CancelledError):
                     await task
 
-    for followup in pending_followups:
-        await _run_turn(session, followup, prompt, allow_controls=allow_controls)
+    return pending_followups
+
+
+async def _run_turn(
+    session: AgentSession,
+    text: str,
+    prompt: PromptSession[str],
+    *,
+    allow_controls: bool,
+) -> None:
+    queued = [text]
+    while queued:
+        current = queued.pop(0)
+        queued.extend(
+            await _run_single_turn(session, current, prompt, allow_controls=allow_controls)
+        )
 
 
 def _help() -> None:
-    console.print(
-        """[bold]Commands[/bold]
-/help                     show this help
-/diff                     show status, stat, and patch
-/checkpoint [label]       commit a recoverable checkpoint
-/rollback CHECKPOINT      restore files and saved agent state
-/compact                  summarize older conversation history
-/fork [SESSION_ID]        fork conversation and Git worktree, then switch
-/approvals                list pending approval requests
-/approve REQUEST_ID       approve a blocked tool call
-/deny REQUEST_ID          deny a blocked tool call
-/replay [N]               show the last N durable session events
-/reload                    reload AGENTS.md and skills
-/workspace                 print the isolated worktree path
-/exit                      save and exit
-
-During a turn, use /cancel, /approve, or /deny at the running prompt.
-Plain text entered during a turn is queued as the next request."""
-    )
+    renderer.help()
 
 
 async def _interactive(manager: AgentSessionManager, session: AgentSession) -> None:
     terminal = PromptSession[str]()
-    console.print(f"Session [bold]{session.session_id}[/bold]")
-    console.print(f"Worktree: {session.workspace}")
-    _help()
-    with patch_stdout():
+    renderer.banner(session.session_id, session.current_model, session.workspace)
+    with patch_stdout(raw=True):
         while True:
             try:
                 text = (await terminal.prompt_async("nooa-code> ")).strip()
@@ -157,9 +148,18 @@ async def _interactive(manager: AgentSessionManager, session: AgentSession) -> N
                 console.print(Syntax(diff.status + diff.stat + diff.patch, "diff"))
             elif text.startswith("/checkpoint"):
                 label = text.partition(" ")[2].strip() or "manual"
-                console.print_json(session.checkpoint(label).model_dump_json())
+                checkpoint = session.checkpoint(label)
+                console.print(
+                    Text(
+                        f"Checkpoint {checkpoint.checkpoint_id} saved ({checkpoint.label}).",
+                        style="green",
+                    )
+                )
             elif text.startswith("/rollback "):
-                console.print_json(session.rollback(text.split(maxsplit=1)[1]).model_dump_json())
+                checkpoint = session.rollback(text.split(maxsplit=1)[1])
+                console.print(
+                    Text(f"Restored checkpoint {checkpoint.checkpoint_id}.", style="green")
+                )
             elif text == "/compact":
                 console.print(f"summary tag: {await session.compact()}")
             elif text.startswith("/fork"):
@@ -167,12 +167,9 @@ async def _interactive(manager: AgentSessionManager, session: AgentSession) -> N
                 child = await session.fork(requested)
                 await session.close()
                 session = child
-                console.print(f"Switched to fork [bold]{session.session_id}[/bold]")
-                console.print(f"Worktree: {session.workspace}")
+                renderer.banner(session.session_id, session.current_model, session.workspace)
             elif text == "/approvals":
-                console.print_json(
-                    json.dumps([item.model_dump() for item in session.approvals.pending()])
-                )
+                renderer.approvals(session.approvals.pending())
             elif text.startswith("/approve "):
                 session.approve(text.split(maxsplit=1)[1])
             elif text.startswith("/deny "):
@@ -187,7 +184,7 @@ async def _interactive(manager: AgentSessionManager, session: AgentSession) -> N
             elif text == "/workspace":
                 console.print(str(session.workspace))
             elif text.startswith("/"):
-                console.print("[red]Unknown command. Use /help.[/red]")
+                console.print(Text("Unknown command. Use /help.", style="red"))
             else:
                 await _run_turn(session, text, terminal, allow_controls=True)
     await session.close()
@@ -255,7 +252,7 @@ def main(
         async def run() -> None:
             if task:
                 terminal = PromptSession[str]()
-                with patch_stdout():
+                with patch_stdout(raw=True):
                     await _run_turn(session, task, terminal, allow_controls=not yes)
                 await session.close()
             else:

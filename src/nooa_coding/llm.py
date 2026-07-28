@@ -6,10 +6,14 @@ import os
 from collections.abc import Callable
 from typing import Any
 
+import litellm
 from nooa.unifiedllm import LLMResponse, Tool, UnifiedLLM, get_llm_client
 from pydantic import BaseModel
 
 from .config import ModelEndpoint
+
+# Suppress litellm's noisy "Provider List" and debug banners for custom models.
+litellm.suppress_debug_info = True
 
 FailoverSink = Callable[[str, str, str], None]
 
@@ -121,7 +125,9 @@ def build_llm(
         kwargs: dict[str, Any] = {}
         if endpoint.api_base:
             kwargs["api_base"] = endpoint.api_base
-        if endpoint.api_key_env:
+        if endpoint.api_key:
+            kwargs["api_key"] = endpoint.api_key
+        elif endpoint.api_key_env:
             api_key = os.environ.get(endpoint.api_key_env)
             if not api_key:
                 raise ValueError(

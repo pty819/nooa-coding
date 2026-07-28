@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from pathlib import Path
 
 from click.testing import CliRunner
@@ -35,6 +36,14 @@ def test_one_shot_cli_uses_formal_session(tmp_path: Path, git_repo: Path, monkey
     monkeypatch.setattr(
         "nooa_coding.session.build_llm", lambda *args, **kwargs: fake_llm(coding_response())
     )
+    patch_calls = []
+
+    @contextmanager
+    def capture_patch_stdout(**kwargs):
+        patch_calls.append(kwargs)
+        yield
+
+    monkeypatch.setattr("nooa_coding.cli.patch_stdout", capture_patch_stdout)
 
     result = CliRunner().invoke(
         main,
@@ -53,6 +62,10 @@ def test_one_shot_cli_uses_formal_session(tmp_path: Path, git_repo: Path, monkey
 
     assert result.exit_code == 0, result.output
     assert "completed" in result.output
+    assert "turn_started" not in result.output
+    assert '"status"' not in result.output
+    assert "?[" not in result.output
+    assert patch_calls == [{"raw": True}]
     listing = CliRunner().invoke(
         main,
         [

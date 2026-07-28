@@ -121,6 +121,11 @@ class AgentSession:
     def status(self) -> SessionStatus:
         return self.metadata.status
 
+    @property
+    def current_model(self) -> str:
+        active = getattr(self.llm, "active", self.llm)
+        return str(getattr(active, "model", getattr(self.llm, "model", "unknown")))
+
     def _last_sequence(self) -> int:
         if not self.trace_path.is_file():
             return 0

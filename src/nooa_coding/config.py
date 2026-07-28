@@ -20,6 +20,7 @@ class ModelEndpoint(BaseModel):
 
     name: str = Field(min_length=1)
     api_base: str | None = None
+    api_key: str | None = None
     api_key_env: str | None = None
     client_type: Literal["completion", "responses"] | None = None
 
