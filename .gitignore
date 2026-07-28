@@ -1,0 +1,10 @@
+.DS_Store
+.env
+.venv/
+.pytest_cache/
+.ruff_cache/
+.nooa-coding/
+__pycache__/
+*.py[cod]
+dist/
+traces/

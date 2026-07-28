@@ -1,0 +1,47 @@
+coding_agent:
+  models:
+    - name: openai/gpt-5
+      api_key_env: OPENAI_API_KEY
+    - name: anthropic/claude-sonnet-4-5
+      api_key_env: ANTHROPIC_API_KEY
+  sessions_dir: ~/.local/share/nooa-coding/sessions
+  worktrees_dir: ~/.local/share/nooa-coding/worktrees
+  verification_commands:
+    - uv run pytest
+  verification_timeout: 300
+  compaction:
+    enabled: true
+    context_fraction: 0.8
+    preserve_recent: 10
+    target_chars: 4000
+  memory:
+    enabled: true
+    path: .nooa-coding/memory.sqlite
+    embedding:
+      backend: litellm
+      model: openai/text-embedding-3-small
+      dimensions: 1536
+  permissions:
+    file_read: allow
+    file_write: ask
+    shell: ask
+    allow_shell:
+      - "git status*"
+      - "git diff*"
+      - "rg *"
+      - "find *"
+      - "uv run pytest*"
+      - "uv run ruff*"
+    deny_shell:
+      - "rm -rf*"
+      - "git reset --hard*"
+      - "git clean -f*"
+  limits:
+    command_timeout: 120
+    verification_timeout: 300
+    max_output_chars: 100000
+    max_stdin_chars: 1000000
+  resources:
+    agents_files: [AGENTS.md]
+    skills_dirs: [.codex/skills, .nooa/skills, .nooa-coding/skills]
+    activate_skills: ["cmd.*"]
