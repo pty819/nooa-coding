@@ -6,6 +6,7 @@ import asyncio
 import json
 from contextlib import suppress
 from pathlib import Path
+from typing import Protocol
 
 import click
 from prompt_toolkit import PromptSession
@@ -23,6 +24,16 @@ console = Console()
 renderer = TerminalRenderer(console)
 
 
+class AsyncPrompt(Protocol):
+    async def prompt_async(self, message: str) -> str: ...
+
+
+class ApprovalController(Protocol):
+    def approve(self, request_id: str) -> None: ...
+
+    def deny(self, request_id: str) -> None: ...
+
+
 async def _next_event(stream: object) -> SessionEvent:
     return await anext(stream)  # type: ignore[arg-type]
 
@@ -31,10 +42,23 @@ def _render_event(event: SessionEvent) -> None:
     renderer.event(event)
 
 
+def _resolve_approval(session: ApprovalController, request_id: str, *, allow: bool) -> bool:
+    """Resolve an approval without letting stale UI input terminate the client."""
+    try:
+        if allow:
+            session.approve(request_id)
+        else:
+            session.deny(request_id)
+    except KeyError:
+        console.print(Text(f"Approval {request_id} is no longer pending.", style="yellow"))
+        return False
+    return True
+
+
 async def _run_single_turn(
     session: AgentSession,
     text: str,
-    prompt: PromptSession[str],
+    prompt: AsyncPrompt,
     *,
     allow_controls: bool,
 ) -> list[str]:
@@ -65,10 +89,17 @@ async def _run_single_turn(
                     cursor = event.sequence
                     _render_event(event)
                     event_task = asyncio.create_task(_next_event(stream))
+            if turn in done:
+                break
             if control_task is not None and control_task in done:
-                command = control_task.result().strip()
+                try:
+                    command = control_task.result().strip()
+                except (EOFError, KeyboardInterrupt):
+                    await session.cancel()
+                    break
                 if command == "/cancel":
                     await session.cancel()
+                    break
                 elif command.lower() in {"y", "yes", "n", "no"}:
                     pending = session.approvals.pending()
                     if len(pending) != 1:
@@ -79,13 +110,22 @@ async def _run_single_turn(
                             )
                         )
                     elif command.lower() in {"y", "yes"}:
-                        session.approve(pending[0].request_id)
+                        _resolve_approval(session, pending[0].request_id, allow=True)
                     else:
-                        session.deny(pending[0].request_id)
+                        _resolve_approval(session, pending[0].request_id, allow=False)
                 elif command.startswith("/approve "):
-                    session.approve(command.split(maxsplit=1)[1])
+                    _resolve_approval(session, command.split(maxsplit=1)[1], allow=True)
                 elif command.startswith("/deny "):
-                    session.deny(command.split(maxsplit=1)[1])
+                    _resolve_approval(session, command.split(maxsplit=1)[1], allow=False)
+                elif command in {"/approve", "/deny"}:
+                    console.print(Text(f"Usage: {command} REQUEST_ID", style="yellow"))
+                elif command.startswith("/"):
+                    console.print(
+                        Text(
+                            "Unknown running command. Use /cancel, /approve, or /deny.",
+                            style="yellow",
+                        )
+                    )
                 elif command:
                     pending_followups.append(command)
                     console.print(Text("Follow-up queued for the next turn.", style="dim"))
@@ -112,7 +152,7 @@ async def _run_single_turn(
 async def _run_turn(
     session: AgentSession,
     text: str,
-    prompt: PromptSession[str],
+    prompt: AsyncPrompt,
     *,
     allow_controls: bool,
 ) -> None:
@@ -171,9 +211,9 @@ async def _interactive(manager: AgentSessionManager, session: AgentSession) -> N
             elif text == "/approvals":
                 renderer.approvals(session.approvals.pending())
             elif text.startswith("/approve "):
-                session.approve(text.split(maxsplit=1)[1])
+                _resolve_approval(session, text.split(maxsplit=1)[1], allow=True)
             elif text.startswith("/deny "):
-                session.deny(text.split(maxsplit=1)[1])
+                _resolve_approval(session, text.split(maxsplit=1)[1], allow=False)
             elif text.startswith("/replay"):
                 raw = text.partition(" ")[2].strip()
                 count = int(raw) if raw else 20
