@@ -16,7 +16,7 @@ def test_layered_settings_target_explicit_repo(tmp_path: Path, monkeypatch) -> N
         encoding="utf-8",
     )
     (repo / ".nooa-coding" / "settings.yaml").write_text(
-        "coding_agent:\n  permissions:\n    shell: ask\n  memory:\n    embedding:\n      backend: litellm\n      model: openai/text-embedding-3-small\n",
+        "coding_agent:\n  permissions:\n    shell: ask\n  memory:\n    embedding:\n      backend: litellm\n      model: openai/text-embedding-3-small\n  mcp:\n    enabled: true\n    enabled_servers: [docs]\n    permissions:\n      default: ask\n      read_only: [docs.search]\n",
         encoding="utf-8",
     )
     monkeypatch.setenv("HOME", str(tmp_path))
@@ -31,6 +31,9 @@ def test_layered_settings_target_explicit_repo(tmp_path: Path, monkeypatch) -> N
     assert loaded.limits.command_timeout == 30
     assert loaded.memory.embedding.backend == "litellm"
     assert loaded.memory.embedding.model == "openai/text-embedding-3-small"
+    assert loaded.mcp.enabled is True
+    assert loaded.mcp.enabled_servers == ("docs",)
+    assert loaded.mcp.permissions.read_only == ("docs.search",)
     assert settings_paths(repo) == [
         (tmp_path / ".config" / "nooa-coding" / "settings.yaml").resolve(),
         (repo / ".nooa-coding" / "settings.yaml").resolve(),

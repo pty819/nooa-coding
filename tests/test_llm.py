@@ -16,6 +16,7 @@ class StubLLM(UnifiedLLM):
         super().__init__(model)
         self.error = error
         self.calls = 0
+        self.last_messages: list[dict[str, Any]] = []
 
     def call(
         self,
@@ -25,6 +26,7 @@ class StubLLM(UnifiedLLM):
         **kwargs: Any,
     ) -> LLMResponse:
         self.calls += 1
+        self.last_messages = messages
         if self.error:
             raise self.error
         return LLMResponse(
@@ -60,6 +62,27 @@ async def test_model_failover_switches_to_next_client() -> None:
     assert response.content == "secondary"
     assert llm.active is secondary
     assert transitions[0][:2] == ("primary", "secondary")
+
+
+@pytest.mark.asyncio
+async def test_model_failover_binds_runtime_identity_for_each_provider() -> None:
+    primary = StubLLM("primary", error=TimeoutError("down"))
+    secondary = StubLLM("secondary")
+    llm = FailoverLLM([primary, secondary])
+    messages = [
+        {
+            "role": "system",
+            "content": "Actual: <nooa-active-model>primary</nooa-active-model>",
+        }
+    ]
+
+    await llm.acall(messages)
+
+    assert "<nooa-active-model>primary</nooa-active-model>" in primary.last_messages[0]["content"]
+    assert (
+        "<nooa-active-model>secondary</nooa-active-model>" in secondary.last_messages[0]["content"]
+    )
+    assert "<nooa-active-model>primary</nooa-active-model>" in messages[0]["content"]
 
 
 @pytest.mark.asyncio

@@ -6,6 +6,7 @@ from rich.console import Console
 
 from nooa_coding.agent import CodingTaskResult, VerificationResult
 from nooa_coding.events import SessionEvent
+from nooa_coding.mcp import MCPServerStatus
 from nooa_coding.terminal import TerminalRenderer, clean_terminal_text
 
 
@@ -64,4 +65,34 @@ def test_help_renders_optional_arguments_literally() -> None:
     renderer.help()
     output = stream.getvalue()
     assert "/fork [SESSION_ID]" in output
+    assert "/mcp tools [SERVER]" in output
     assert "**[**" not in output
+
+
+def test_renderer_shows_mcp_status_and_call_events_without_arguments() -> None:
+    renderer, stream = _renderer()
+    renderer.mcp_status(
+        [
+            MCPServerStatus(
+                name="docs",
+                status="connected",
+                source=".mcp.json",
+                attribute="mcp_docs",
+                tools=["search"],
+            )
+        ],
+        [],
+    )
+    renderer.event(
+        SessionEvent(
+            sequence=1,
+            session_id="s",
+            kind="tool",
+            name="mcp_call_started",
+            data={"server": "docs", "tool": "search", "argument_names": ["secret"]},
+        )
+    )
+    output = stream.getvalue()
+    assert "mcp_docs" in output
+    assert "MCP docs.search" in output
+    assert "secret" not in output

@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "docs": {
+      "url": "https://mcp.example.com/mcp",
+      "transport": "streamable-http",
+      "headers": {
+        "Authorization": "Bearer ${DOCS_MCP_TOKEN}"
+      }
+    },
+    "local-tools": {
+      "command": "uvx",
+      "args": ["example-mcp-server"],
+      "transport": "stdio"
+    }
+  }
+}

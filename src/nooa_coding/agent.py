@@ -20,12 +20,15 @@ from nooa_memory import MemoryManager, MemoryToolsMixin
 from pydantic import BaseModel, Field
 
 from .config import CodingSettings
-from .policy import PolicyShellTools
+from .mcp import MCPRuntime
+from .policy import ApprovalManager, PolicyShellTools
 from .resources import install_resources, load_agents_context
 
 with hidden:
     import ast
     import hashlib
+
+    from .system_prompt import render_runtime_system_context
 
 if TYPE_CHECKING:
     from nooa.storage.manager import StorageManager
@@ -144,7 +147,10 @@ def _cell_policy_violation(code: str) -> str | None:
 
 
 class CodingAgent(MemoryToolsMixin, InteractiveAgent):
-    """Solve coding tasks inside one isolated worktree with evidence and approval gates."""
+    """Operate as NOOA Coding Agent inside an isolated Git worktree.
+
+    {self._runtime_system_context()}
+    """
 
     shell: Annotated[PolicyShellTools, nosnapshot]
     repo: Annotated[RepoTools, nosnapshot]
@@ -156,6 +162,7 @@ class CodingAgent(MemoryToolsMixin, InteractiveAgent):
     _settings: Annotated[CodingSettings, hidden, nosnapshot]
     _event_sink: Annotated[Any, hidden, nosnapshot]
     _memory: Annotated[MemoryManager, hidden, nosnapshot]
+    _mcp: Annotated[MCPRuntime, hidden, nosnapshot]
 
     def __init__(
         self,
@@ -163,6 +170,7 @@ class CodingAgent(MemoryToolsMixin, InteractiveAgent):
         repo: str | Path,
         settings: CodingSettings,
         shell: PolicyShellTools,
+        approvals: ApprovalManager,
         event_sink: Any,
         *,
         storage: StorageManager | None = None,
@@ -175,6 +183,13 @@ class CodingAgent(MemoryToolsMixin, InteractiveAgent):
         self.repo = RepoTools(root=self._repo_root, session=self.shell._session)
         self.todo = TodoManager()
         self.skills = install_resources(self, self._repo_root, settings.resources)
+        self._mcp = MCPRuntime(
+            self._repo_root,
+            settings.mcp,
+            approvals,
+            event_sink,
+        )
+        self._mcp.install(self)
         self.context_manager["coding_tools"] = Context(
             doc(PolicyShellTools, RepoTools, TodoManager), prefix=True
         )
@@ -247,6 +262,7 @@ class CodingAgent(MemoryToolsMixin, InteractiveAgent):
         memory = getattr(self, "_memory", None)
         if isinstance(memory, MemoryManager):
             memory.uninstall()
+        self._mcp.close()
         await self.shell.close()
 
     @hidden
@@ -261,6 +277,12 @@ class CodingAgent(MemoryToolsMixin, InteractiveAgent):
     def _current_model(self) -> str:
         active = getattr(self.llm, "active", self.llm)
         return str(getattr(active, "model", getattr(self.llm, "model", "unknown")))
+
+    def _runtime_system_context(self) -> str:
+        return render_runtime_system_context(
+            active_model=self._current_model(),
+            worktree=self._repo_root,
+        )
 
     def _local_answer(self, task: str) -> str | None:
         normalized = " ".join(task.lower().split())
@@ -441,7 +463,6 @@ class CodingAgent(MemoryToolsMixin, InteractiveAgent):
         if not task:
             raise ValueError("task must be non-empty")
         self.task = task
-        model = self._current_model()
         local_answer = self._local_answer(task)
         if local_answer is not None:
             result = CodingTaskResult(
@@ -449,7 +470,7 @@ class CodingAgent(MemoryToolsMixin, InteractiveAgent):
                 status="answered",
                 summary=local_answer,
                 evidence="Answered from live host session configuration.",
-                model=model,
+                model=self._current_model(),
             )
             self.last_result = result
             return result
@@ -464,7 +485,7 @@ class CodingAgent(MemoryToolsMixin, InteractiveAgent):
                 status="answered",
                 summary=draft.answer,
                 evidence="Generated without repository mutation tools.",
-                model=model,
+                model=self._current_model(),
             )
             self.last_result = result
             return result
@@ -472,7 +493,7 @@ class CodingAgent(MemoryToolsMixin, InteractiveAgent):
         if not self.todo.list_todos():
             self.todo.add("Inspect the repository and establish concrete evidence")
         if mode == "inspect":
-            async with self.shell._read_only_scope():
+            async with self.shell._read_only_scope(), self._mcp.read_only():
                 inspection = await self._inspect_repository(task)
             result = CodingTaskResult(
                 mode=mode,
@@ -480,7 +501,7 @@ class CodingAgent(MemoryToolsMixin, InteractiveAgent):
                 summary=inspection.summary,
                 root_cause=inspection.root_cause,
                 evidence=inspection.evidence,
-                model=model,
+                model=self._current_model(),
             )
             self.last_result = result
             return result
@@ -549,7 +570,7 @@ class CodingAgent(MemoryToolsMixin, InteractiveAgent):
             changed_files=changed_files,
             evidence=draft.evidence,
             verifications=verifications,
-            model=model,
+            model=self._current_model(),
         )
         self.last_result = result
         return result

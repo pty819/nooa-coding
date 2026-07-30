@@ -92,6 +92,36 @@ class ResourceSettings(BaseModel):
     max_context_chars: int = Field(default=100_000, gt=0)
 
 
+class MCPPermissionSettings(BaseModel):
+    """Policy for external MCP calls, matched as ``server.tool`` globs."""
+
+    model_config = ConfigDict(frozen=True)
+
+    default: PermissionMode = "ask"
+    allow: tuple[str, ...] = ()
+    deny: tuple[str, ...] = ()
+    read_only: tuple[str, ...] = ()
+
+
+class MCPSettings(BaseModel):
+    """External MCP servers consumed by the coding agent."""
+
+    model_config = ConfigDict(frozen=True)
+
+    enabled: bool = False
+    config_files: tuple[str, ...] = (
+        "~/.config/nooa-coding/mcp.json",
+        ".mcp.json",
+    )
+    enabled_servers: tuple[str, ...] = ("*",)
+    disabled_servers: tuple[str, ...] = ()
+    servers: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    fail_on_error: bool = False
+    call_timeout: float = Field(default=60, gt=0)
+    max_output_chars: int = Field(default=100_000, gt=0)
+    permissions: MCPPermissionSettings = Field(default_factory=MCPPermissionSettings)
+
+
 class CodingSettings(BaseModel):
     """Complete local application settings."""
 
@@ -106,6 +136,7 @@ class CodingSettings(BaseModel):
     permissions: PermissionSettings = Field(default_factory=PermissionSettings)
     limits: LimitSettings = Field(default_factory=LimitSettings)
     resources: ResourceSettings = Field(default_factory=ResourceSettings)
+    mcp: MCPSettings = Field(default_factory=MCPSettings)
 
     @model_validator(mode="before")
     @classmethod
@@ -188,6 +219,8 @@ __all__ = [
     "CompactionSettings",
     "LimitSettings",
     "MemorySettings",
+    "MCPPermissionSettings",
+    "MCPSettings",
     "ModelEndpoint",
     "PermissionSettings",
     "ResourceSettings",

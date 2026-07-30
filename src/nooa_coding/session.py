@@ -9,7 +9,7 @@ import json
 import re
 import sqlite3
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -21,13 +21,29 @@ from pydantic import BaseModel, Field
 
 from .agent import CodingAgent, CodingTaskResult
 from .config import CodingSettings, load_settings
-from .events import SessionEvent, SessionEventKind
+from .events import SessionEvent, SessionEventKind, TokenUsage
 from .llm import build_llm
+from .mcp import MCPServerStatus
 from .policy import ApprovalManager, PermissionPolicy, PolicyShellTools
 from .workspace import Checkpoint, DiffResult, WorkspaceInfo, WorkspaceManager
 
 SessionStatus = Literal["idle", "running", "cancelling", "cancelled", "failed"]
 _SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
+class GoalState(BaseModel):
+    """Tracks an active goal-driven reconcile loop."""
+
+    objective: str
+    turn_budget: int = 10
+    turns_used: int = 0
+    status: Literal["active", "achieved", "exhausted", "cleared"] = "active"
+    started_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
+    last_evaluation: str = ""
+
+    @property
+    def turns_remaining(self) -> int:
+        return max(0, self.turn_budget - self.turns_used)
 
 
 class SessionMetadata(BaseModel):
@@ -83,6 +99,8 @@ class AgentSession:
         self._run_lock = asyncio.Lock()
         self._active_task: asyncio.Task[CodingTaskResult] | None = None
         self._closed = False
+        self._token_usage = TokenUsage()
+        self._goal: GoalState | None = None
 
         self.approvals = ApprovalManager(self._policy_event)
         policy = PermissionPolicy(settings.permissions, self.approvals)
@@ -99,6 +117,7 @@ class AgentSession:
             repo=metadata.workspace.path,
             settings=settings,
             shell=shell,
+            approvals=self.approvals,
             event_sink=self._tool_event,
             storage=self.storage,
         )
@@ -125,6 +144,188 @@ class AgentSession:
     def current_model(self) -> str:
         active = getattr(self.llm, "active", self.llm)
         return str(getattr(active, "model", getattr(self.llm, "model", "unknown")))
+
+    @property
+    def available_models(self) -> list[str]:
+        """List all model names in the failover chain."""
+        clients = getattr(self.llm, "clients", None)
+        if clients:
+            return [str(c.model) for c in clients]
+        return [self.current_model]
+
+    def switch_model(self, model_name: str) -> str:
+        """Switch the active model at runtime. Returns the new active model name."""
+        clients = getattr(self.llm, "clients", None)
+        if not clients:
+            raise RuntimeError("model switching requires a failover LLM with multiple models")
+        for index, client in enumerate(clients):
+            if client.model == model_name:
+                self.llm.active_index = index  # type: ignore[union-attr]
+                self.llm.model = client.model  # type: ignore[union-attr]
+                self._emit("session", "model_switched", {"model": model_name})
+                return model_name
+        available = ", ".join(c.model for c in clients)
+        raise ValueError(f"unknown model '{model_name}'. Available: {available}")
+
+    def switch_permissions(self, mode: str) -> None:
+        """Switch permission mode at runtime: 'allow', 'ask', or 'default'."""
+        policy = self.agent.shell._policy  # noqa: SLF001
+        if mode == "allow":
+            policy.settings = self.settings.permissions.model_copy(
+                update={"file_read": "allow", "file_write": "allow", "shell": "allow"}
+            )
+        elif mode == "ask":
+            policy.settings = self.settings.permissions.model_copy(
+                update={"file_write": "ask", "shell": "ask"}
+            )
+        elif mode == "default":
+            policy.settings = self.settings.permissions
+        else:
+            raise ValueError(f"unknown permission mode '{mode}'. Use: allow, ask, default")
+        self._emit("session", "permissions_changed", {"mode": mode})
+
+    async def review(self) -> str:
+        """Run an LLM-powered code review on the current worktree diff."""
+        diff = WorkspaceManager.diff(self.workspace)
+        patch_text = diff.patch.strip()
+        if not patch_text:
+            return "No changes to review. The worktree is clean."
+        review_prompt = (
+            "You are a senior code reviewer. Review the following diff and provide:\n"
+            "1. A brief summary of what changed\n"
+            "2. Potential bugs or logic errors\n"
+            "3. Security concerns\n"
+            "4. Style/readability suggestions\n\n"
+            f"```diff\n{patch_text[:50000]}\n```"
+        )
+        messages = [{"role": "user", "content": review_prompt}]
+        response = await self.llm.acall(messages)
+        self._emit("session", "review_completed", {"files": diff.stat})
+        return response.content or "Review produced no output."
+
+    async def plan(self, task: str) -> str:
+        """Generate an implementation plan for a task without executing it."""
+        plan_prompt = (
+            "You are a senior software architect. Create a detailed implementation plan "
+            "for the following task. Include:\n"
+            "1. Analysis of what needs to change\n"
+            "2. Step-by-step implementation plan with file paths\n"
+            "3. Potential risks and edge cases\n"
+            "4. Suggested verification steps\n\n"
+            "Do NOT write any code. Only produce the plan.\n\n"
+            f"Task: {task}"
+        )
+        messages = [{"role": "user", "content": plan_prompt}]
+        response = await self.llm.acall(messages)
+        self._emit("session", "plan_generated", {"task": task[:200]})
+        return response.content or "Plan produced no output."
+
+    async def web_search(self, query: str) -> str:
+        """Search the web and return summarized results."""
+        import urllib.parse
+        import urllib.request
+
+        encoded = urllib.parse.quote_plus(query)
+        url = f"https://html.duckduckgo.com/html/?q={encoded}"
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "nooa-coding/0.1"})
+            with urllib.request.urlopen(req, timeout=15) as resp:  # noqa: S310
+                html = resp.read().decode("utf-8", errors="replace")
+        except Exception as exc:
+            self._emit("error", "web_search_failed", {"query": query, "error": str(exc)})
+            return f"Web search failed: {exc}"
+
+        # Extract result snippets from DuckDuckGo HTML.
+        import re as _re
+
+        results: list[str] = []
+        for match in _re.finditer(
+            r'class="result__a"[^>]*>(.*?)</a>.*?class="result__snippet"[^>]*>(.*?)</span>',
+            html,
+            _re.DOTALL,
+        ):
+            title = _re.sub(r"<[^>]+>", "", match.group(1)).strip()
+            snippet = _re.sub(r"<[^>]+>", "", match.group(2)).strip()
+            if title:
+                results.append(f"- {title}: {snippet}")
+            if len(results) >= 8:
+                break
+
+        if not results:
+            return f"No results found for: {query}"
+        self._emit("session", "web_search_completed", {"query": query, "count": len(results)})
+        return f"Web search results for '{query}':\n\n" + "\n".join(results)
+
+    # ─── Goal mode ───────────────────────────────────────────────────────────
+
+    @property
+    def goal(self) -> GoalState | None:
+        """Current active goal, or None."""
+        return self._goal
+
+    def set_goal(self, objective: str, *, turn_budget: int = 10) -> GoalState:
+        """Set a goal-driven reconcile loop."""
+        self._goal = GoalState(objective=objective, turn_budget=turn_budget)
+        self._emit("session", "goal_set", {"objective": objective, "turn_budget": turn_budget})
+        return self._goal
+
+    def clear_goal(self) -> None:
+        """Clear the active goal."""
+        if self._goal is not None:
+            self._goal.status = "cleared"
+            self._emit("session", "goal_cleared", {"objective": self._goal.objective})
+            self._goal = None
+
+    async def evaluate_goal(self, last_result: CodingTaskResult) -> tuple[bool, str]:
+        """Evaluate whether the active goal has been achieved.
+
+        Returns (achieved, reason). Uses the LLM as an independent evaluator.
+        """
+        if self._goal is None:
+            return True, "no active goal"
+        self._goal.turns_used += 1
+
+        if self._goal.turns_remaining <= 0:
+            self._goal.status = "exhausted"
+            reason = f"Turn budget exhausted ({self._goal.turn_budget} turns used)."
+            self._goal.last_evaluation = reason
+            self._emit("session", "goal_exhausted", {"turns_used": self._goal.turns_used})
+            return False, reason
+
+        # Use the LLM as an independent evaluator.
+        eval_prompt = (
+            "You are an independent evaluator. Your ONLY job is to determine whether "
+            "the following goal has been achieved based on the evidence provided.\n\n"
+            f"GOAL: {self._goal.objective}\n\n"
+            "LAST TURN RESULT:\n"
+            f"- status: {last_result.status}\n"
+            f"- summary: {last_result.summary}\n"
+            f"- changed_files: {last_result.changed_files}\n"
+            f"- evidence: {last_result.evidence[:2000]}\n\n"
+            "Respond with EXACTLY one of:\n"
+            "ACHIEVED: <brief reason>\n"
+            "NOT_ACHIEVED: <what is still missing and what should be done next>\n"
+        )
+        messages = [{"role": "user", "content": eval_prompt}]
+        response = await self.llm.acall(messages)
+        evaluation = response.content or "NOT_ACHIEVED: evaluator produced no output"
+        self._goal.last_evaluation = evaluation
+
+        achieved = evaluation.strip().upper().startswith("ACHIEVED")
+        if achieved:
+            self._goal.status = "achieved"
+            self._emit("session", "goal_achieved", {
+                "objective": self._goal.objective,
+                "turns_used": self._goal.turns_used,
+                "evaluation": evaluation,
+            })
+        else:
+            self._emit("session", "goal_not_achieved", {
+                "turns_used": self._goal.turns_used,
+                "turns_remaining": self._goal.turns_remaining,
+                "evaluation": evaluation,
+            })
+        return achieved, evaluation
 
     def _last_sequence(self) -> int:
         if not self.trace_path.is_file():
@@ -182,13 +383,63 @@ class AgentSession:
             {"from": source, "to": target, "error": error},
         )
 
+    @property
+    def token_usage(self) -> TokenUsage:
+        return self._token_usage.model_copy()
+
     def _on_nooa_event(self, event: Any) -> None:
+        event_type = getattr(event, "event_type", type(event).__name__)
+        # Emit thinking indicators for LLM call lifecycle.
+        if event_type == "LLMCallStart":
+            self._emit(
+                "thinking",
+                "llm_call_started",
+                {
+                    "method": getattr(event, "method_name", ""),
+                    "turn": getattr(event, "turn_number", 0),
+                },
+            )
+            return
+        if event_type == "LLMCallEnd":
+            self._emit(
+                "thinking",
+                "llm_call_ended",
+                {
+                    "method": getattr(event, "method_name", ""),
+                    "success": getattr(event, "success", True),
+                },
+            )
+            return
+        # Accumulate token usage from LLMComplete metrics.
+        if event_type == "LLMComplete":
+            self._token_usage.add(
+                prompt_tokens=getattr(event, "prompt_tokens", 0),
+                completion_tokens=getattr(event, "completion_tokens", 0),
+                cached_tokens=getattr(event, "cached_tokens", 0),
+                reasoning_tokens=getattr(event, "reasoning_tokens", 0),
+                cost_usd=getattr(event, "cost_usd", 0.0),
+            )
+            self._emit(
+                "usage",
+                "token_usage",
+                {
+                    "prompt_tokens": getattr(event, "prompt_tokens", 0),
+                    "completion_tokens": getattr(event, "completion_tokens", 0),
+                    "cached_tokens": getattr(event, "cached_tokens", 0),
+                    "reasoning_tokens": getattr(event, "reasoning_tokens", 0),
+                    "cost_usd": getattr(event, "cost_usd", 0.0),
+                    "model": getattr(event, "model_name", ""),
+                    "cumulative_tokens": self._token_usage.total_tokens,
+                    "cumulative_cost_usd": self._token_usage.total_cost_usd,
+                },
+            )
+            return
         try:
             payload = event.model_dump(mode="json")
         except Exception:
             payload = {"text": str(event)}
         kind: SessionEventKind = "message" if isinstance(event, AgentMessage) else "agent"
-        self._emit(kind, getattr(event, "event_type", type(event).__name__), payload)
+        self._emit(kind, event_type, payload)
 
     def _save_snapshot(self) -> str:
         snapshot_id = self.storage.save_snapshot(self.agent)
@@ -263,6 +514,30 @@ class AgentSession:
 
     def deny(self, request_id: str) -> None:
         self.approvals.decide(request_id, allow=False)
+
+    def mcp_status(self) -> list[MCPServerStatus]:
+        return self.agent._mcp.statuses()
+
+    def mcp_config_errors(self) -> list[str]:
+        return list(self.agent._mcp.config_errors)
+
+    def mcp_tools(self, server_name: str | None = None) -> dict[str, list[str]]:
+        return self.agent._mcp.tools(server_name)
+
+    def mcp_enable(self, server_name: str) -> MCPServerStatus:
+        if self._active_task is not None:
+            raise RuntimeError("cannot change MCP servers while a turn is running")
+        return self.agent._mcp.enable(server_name)
+
+    def mcp_disable(self, server_name: str) -> MCPServerStatus:
+        if self._active_task is not None:
+            raise RuntimeError("cannot change MCP servers while a turn is running")
+        return self.agent._mcp.disable(server_name)
+
+    def mcp_reload(self, server_name: str | None = None) -> list[MCPServerStatus]:
+        if self._active_task is not None:
+            raise RuntimeError("cannot reload MCP servers while a turn is running")
+        return self.agent._mcp.reload(server_name)
 
     async def compact(self, *, preserve_recent: int | None = None) -> str | None:
         if self._active_task is not None:
@@ -526,6 +801,48 @@ class AgentSessionManager:
             {"parent_session_id": source.session_id, "checkpoint": checkpoint.checkpoint_id},
         )
         return session
+
+    async def delegate_parallel(
+        self,
+        source: AgentSession,
+        subtasks: list[str],
+        *,
+        llm_factory: Callable[[], UnifiedLLM] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Spawn parallel child sessions for independent subtasks.
+
+        Each subtask runs in its own forked worktree. Results are collected
+        and returned as a list of dicts with session_id, status, and summary.
+        """
+        checkpoint = source.checkpoint("delegate")
+        results: list[dict[str, Any]] = []
+
+        async def _run_one(index: int, task: str) -> dict[str, Any]:
+            child_llm = llm_factory() if llm_factory else None
+            child = self.fork(
+                source, checkpoint, new_session_id=f"{source.session_id}-sub{index}", llm=child_llm
+            )
+            try:
+                result = await child.prompt(task)
+                return {
+                    "session_id": child.session_id,
+                    "task": task[:100],
+                    "status": result.status,
+                    "summary": result.summary[:200],
+                }
+            except Exception as exc:
+                return {
+                    "session_id": child.session_id,
+                    "task": task[:100],
+                    "status": "failed",
+                    "summary": f"{type(exc).__name__}: {exc}",
+                }
+            finally:
+                await child.close()
+
+        tasks = [_run_one(i, subtask) for i, subtask in enumerate(subtasks)]
+        results = list(await asyncio.gather(*tasks))
+        return results
 
 
 __all__ = [

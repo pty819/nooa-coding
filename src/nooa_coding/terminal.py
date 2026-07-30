@@ -13,10 +13,12 @@ from rich.table import Table
 from rich.text import Text
 
 from .agent import CodingTaskResult
-from .events import SessionEvent
+from .events import SessionEvent, TokenUsage
 
 if TYPE_CHECKING:
+    from .mcp import MCPServerStatus
     from .policy import ApprovalRequest
+    from .session import AgentSession
 
 
 _ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
@@ -58,6 +60,21 @@ class TerminalRenderer:
             ("/deny REQUEST_ID", "Deny one pending operation"),
             ("/replay [N]", "Show recent durable events"),
             ("/reload", "Reload AGENTS.md and skills"),
+            ("/mcp list", "Show external MCP server status"),
+            ("/mcp tools [SERVER]", "List injected MCP tools"),
+            ("/mcp enable|disable SERVER", "Connect or disconnect an MCP server"),
+            ("/mcp reload [SERVER]", "Reload MCP configuration and tools"),
+            ("/cost", "Show token usage and estimated cost"),
+            ("/status", "Show session status panel"),
+            ("/clear", "Clear conversation history"),
+            ("/model [NAME]", "Show or switch the active model"),
+            ("/permissions [MODE]", "Show or switch permission mode (allow/ask/default)"),
+            ("/plan TASK", "Generate an implementation plan without executing"),
+            ("/goal OBJECTIVE", "Set a goal; agent auto-continues until achieved"),
+            ("/goal clear", "Clear the active goal"),
+            ("/review", "LLM-powered code review of the current diff"),
+            ("/search QUERY", "Web search and return results"),
+            ("/export", "Export session events to JSONL"),
             ("/workspace", "Print the isolated worktree path"),
             ("/exit", "Save and exit"),
         )
@@ -73,8 +90,30 @@ class TerminalRenderer:
                 style="dim",
             )
         )
+        self.console.print(
+            Text(
+                "Input: Ctrl+J newline, Ctrl+G external editor, Tab completion.",
+                style="dim",
+            )
+        )
 
     def event(self, event: SessionEvent) -> None:
+        if event.kind == "thinking":
+            if event.name == "llm_call_started":
+                method = event.data.get("method", "")
+                turn = event.data.get("turn", 0)
+                label = f" {method}" if method else ""
+                self.console.print(
+                    Text(f"⟳ thinking{label} (turn {turn})…", style="dim italic")
+                )
+            elif event.name == "llm_call_ended":
+                success = event.data.get("success", True)
+                if not success:
+                    self.console.print(Text("✗ LLM call failed", style="red"))
+            return
+        if event.kind == "usage":
+            # Token usage events are tracked silently; shown via /cost.
+            return
         if event.kind == "message":
             content = event.data.get("content")
             if content:
@@ -118,6 +157,40 @@ class TerminalRenderer:
         if event.name == "file_changed":
             path = clean_terminal_text(event.data.get("path", ""))
             self.console.print(Text(f"Changed {path}", style="green"))
+            return
+        if event.name == "mcp_server_connected":
+            server = clean_terminal_text(event.data.get("server", ""))
+            tools = len(event.data.get("tools", []))
+            self.console.print(
+                Text(f"Connected MCP server {server} ({tools} tools)", style="green")
+            )
+            return
+        if event.name == "mcp_server_failed":
+            server = clean_terminal_text(event.data.get("server", ""))
+            error = clean_terminal_text(event.data.get("error", ""))
+            self.console.print(
+                Panel(error, title=f"MCP server failed · {server}", border_style="yellow")
+            )
+            return
+        if event.name == "mcp_call_started":
+            server = clean_terminal_text(event.data.get("server", ""))
+            tool = clean_terminal_text(event.data.get("tool", ""))
+            self.console.print(Text(f"MCP {server}.{tool}", style="magenta"))
+            return
+        if event.name == "mcp_call_finished":
+            elapsed = event.data.get("duration_ms", 0)
+            truncated = " · output truncated" if event.data.get("truncated") else ""
+            self.console.print(
+                Text(f"✓ MCP call finished in {elapsed} ms{truncated}", style="dim green")
+            )
+            return
+        if event.name == "mcp_call_failed":
+            server = clean_terminal_text(event.data.get("server", ""))
+            tool = clean_terminal_text(event.data.get("tool", ""))
+            error = clean_terminal_text(event.data.get("error", ""))
+            self.console.print(
+                Panel(error, title=f"MCP call failed · {server}.{tool}", border_style="red")
+            )
             return
         if event.name == "cell_guard_blocked":
             reason = clean_terminal_text(event.data.get("reason", ""))
@@ -179,6 +252,76 @@ class TerminalRenderer:
         table = Table("ID", "Kind", "Resource", title="Pending approvals")
         for item in pending:
             table.add_row(item.request_id, item.kind, clean_terminal_text(item.resource))
+        self.console.print(table)
+
+    def token_usage(self, usage: TokenUsage) -> None:
+        """Render cumulative token usage and cost."""
+        if usage.llm_calls == 0:
+            self.console.print(Text("No LLM calls yet.", style="dim"))
+            return
+        table = Table(title="Token Usage", box=None, show_header=False, pad_edge=False)
+        table.add_column(style="bold", no_wrap=True)
+        table.add_column(justify="right")
+        table.add_row("LLM calls", str(usage.llm_calls))
+        table.add_row("Prompt tokens", f"{usage.total_prompt_tokens:,}")
+        table.add_row("Completion tokens", f"{usage.total_completion_tokens:,}")
+        if usage.total_cached_tokens:
+            table.add_row("Cached tokens", f"{usage.total_cached_tokens:,}")
+        if usage.total_reasoning_tokens:
+            table.add_row("Reasoning tokens", f"{usage.total_reasoning_tokens:,}")
+        table.add_row("Total tokens", f"{usage.total_tokens:,}")
+        if usage.total_cost_usd > 0:
+            table.add_row("Est. cost", f"${usage.total_cost_usd:.4f}")
+        self.console.print(table)
+
+    def status(self, session: AgentSession) -> None:
+        """Render a comprehensive status panel."""
+        usage = session.token_usage
+        details = Table.grid(padding=(0, 2))
+        details.add_column(style="bold", no_wrap=True)
+        details.add_column()
+        details.add_row("Session", session.session_id)
+        details.add_row("Model", session.current_model)
+        details.add_row("Status", session.status)
+        details.add_row("Worktree", str(session.workspace))
+        details.add_row("LLM calls", str(usage.llm_calls))
+        details.add_row("Tokens", f"{usage.total_tokens:,}")
+        if usage.total_cost_usd > 0:
+            details.add_row("Est. cost", f"${usage.total_cost_usd:.4f}")
+        pending = session.approvals.pending()
+        details.add_row("Pending approvals", str(len(pending)))
+        mcp_connected = sum(
+            1 for s in session.mcp_status() if s.status == "connected"
+        )
+        details.add_row("MCP servers", str(mcp_connected))
+        self.console.print(Panel(details, title="Session Status", border_style="cyan"))
+
+    def mcp_status(self, statuses: list[MCPServerStatus], errors: list[str]) -> None:
+        if statuses:
+            table = Table("Server", "Status", "Agent attribute", "Tools", "Source", title="MCP")
+            for item in statuses:
+                table.add_row(
+                    item.name,
+                    item.status,
+                    item.attribute or "—",
+                    str(len(item.tools)),
+                    item.source,
+                )
+                if item.error:
+                    table.add_row("", Text(item.error, style="yellow"), "", "", "")
+            self.console.print(table)
+        else:
+            self.console.print(Text("No MCP servers are configured.", style="dim"))
+        for error in errors:
+            self.console.print(Text(error, style="yellow"))
+
+    def mcp_tools(self, tools: dict[str, list[str]]) -> None:
+        if not tools:
+            self.console.print(Text("No MCP tools are connected.", style="dim"))
+            return
+        table = Table("Server", "Tools", title="External MCP tools")
+        for server, names in tools.items():
+            table.add_row(server, "\n".join(names) if names else "—")
         self.console.print(table)
 
 

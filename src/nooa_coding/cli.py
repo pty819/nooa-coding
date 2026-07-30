@@ -10,12 +10,14 @@ from typing import Protocol
 
 import click
 from prompt_toolkit import PromptSession
+from prompt_toolkit.completion import Completer, Completion
+from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.patch_stdout import patch_stdout
 from rich.console import Console
 from rich.syntax import Syntax
 from rich.text import Text
 
-from .config import ModelEndpoint, load_settings
+from .config import CodingSettings, ModelEndpoint, load_settings
 from .events import SessionEvent
 from .session import AgentSession, AgentSessionManager
 from .terminal import TerminalRenderer
@@ -23,9 +25,141 @@ from .terminal import TerminalRenderer
 console = Console()
 renderer = TerminalRenderer(console)
 
+_SLASH_COMMANDS = [
+    "/help",
+    "/diff",
+    "/checkpoint",
+    "/rollback",
+    "/compact",
+    "/fork",
+    "/approvals",
+    "/approve",
+    "/deny",
+    "/replay",
+    "/reload",
+    "/mcp",
+    "/cost",
+    "/status",
+    "/clear",
+    "/model",
+    "/permissions",
+    "/review",
+    "/plan",
+    "/goal",
+    "/search",
+    "/export",
+    "/workspace",
+    "/exit",
+]
+
+
+class SlashCompleter(Completer):
+    """Complete slash commands and @file mentions."""
+
+    def __init__(self, workspace: Path | None = None) -> None:
+        self._workspace = workspace
+
+    def get_completions(self, document, complete_event):  # noqa: ANN001, ANN201
+        text = document.text_before_cursor
+        # Slash command completion at start of input.
+        if text.startswith("/"):
+            for command in _SLASH_COMMANDS:
+                if command.startswith(text) and command != text:
+                    yield Completion(command, start_position=-len(text))
+            return
+        # @file mention completion: find the last @token in the input.
+        at_idx = text.rfind("@")
+        if at_idx >= 0:
+            # Only trigger if @ is at start or preceded by whitespace.
+            if at_idx == 0 or text[at_idx - 1] in (" ", "\n", "\t"):
+                query = text[at_idx + 1:]
+                # Don't complete if there's a space after @ (already typed path).
+                if " " not in query or query.endswith("/"):
+                    yield from self._file_completions(query, at_idx, text)
+
+    def _file_completions(self, query: str, at_idx: int, full_text: str):  # noqa: ANN001, ANN201
+        """Fuzzy-match files in the workspace."""
+        if self._workspace is None or not self._workspace.is_dir():
+            return
+        prefix_len = len(full_text) - at_idx  # includes the @
+        matches: list[str] = []
+        try:
+            for path in sorted(self._workspace.rglob("*")):
+                if len(matches) >= 20:
+                    break
+                rel = str(path.relative_to(self._workspace))
+                # Skip hidden dirs and common noise.
+                if any(part.startswith(".") for part in path.relative_to(self._workspace).parts):
+                    continue
+                if "__pycache__" in rel or "node_modules" in rel:
+                    continue
+                if query.lower() in rel.lower():
+                    suffix = "/" if path.is_dir() else ""
+                    matches.append(rel + suffix)
+        except OSError:
+            return
+        for match in matches:
+            display = f"@{match}"
+            yield Completion(display, start_position=-prefix_len)
+
+
+def _build_key_bindings() -> KeyBindings:
+    """Multi-line input: Ctrl+J inserts newline, Enter sends, Ctrl+G opens editor."""
+    bindings = KeyBindings()
+
+    @bindings.add("c-j")
+    def _newline(event):  # noqa: ANN001, ANN202
+        event.current_buffer.insert_text("\n")
+
+    @bindings.add("c-g")
+    def _open_editor(event):  # noqa: ANN001, ANN202
+        """Open $EDITOR for multi-line composition."""
+        import os
+        import subprocess
+        import tempfile
+
+        buf = event.current_buffer
+        editor = os.environ.get("EDITOR", "vi")
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as tmp:
+            tmp.write(buf.text)
+            tmp_path = tmp.name
+        try:
+            subprocess.call([editor, tmp_path])
+            with open(tmp_path, encoding="utf-8") as f:
+                buf.text = f.read().rstrip("\n")
+        finally:
+            os.unlink(tmp_path)
+
+    return bindings
+
 
 class AsyncPrompt(Protocol):
     async def prompt_async(self, message: str) -> str: ...
+
+
+def _expand_at_mentions(text: str, workspace: Path) -> str:
+    """Expand @file references by inlining file content."""
+    import re as _re
+
+    def _replace(match: _re.Match) -> str:  # noqa: ANN001
+        rel_path = match.group(1)
+        target = workspace / rel_path
+        if target.is_file():
+            try:
+                content = target.read_text(encoding="utf-8")
+                # Truncate very large files.
+                if len(content) > 50_000:
+                    content = content[:50_000] + "\n... (truncated)"
+                return f"\n--- @{rel_path} ---\n```\n{content}\n```\n"
+            except (OSError, UnicodeDecodeError):
+                return match.group(0)
+        elif target.is_dir():
+            entries = sorted(p.name for p in target.iterdir())[:50]
+            listing = "\n".join(entries)
+            return f"\n--- @{rel_path}/ (directory) ---\n{listing}\n"
+        return match.group(0)
+
+    return _re.sub(r"@([\w./\-]+)", _replace, text)
 
 
 class ApprovalController(Protocol):
@@ -168,8 +302,50 @@ def _help() -> None:
     renderer.help()
 
 
+def _auto_approve(settings: CodingSettings) -> CodingSettings:
+    permissions = settings.permissions.model_copy(
+        update={"file_read": "allow", "file_write": "allow", "shell": "allow"}
+    )
+    mcp_permissions = settings.mcp.permissions.model_copy(update={"default": "allow"})
+    mcp = settings.mcp.model_copy(update={"permissions": mcp_permissions})
+    return settings.model_copy(update={"permissions": permissions, "mcp": mcp})
+
+
+def _handle_mcp_command(session: AgentSession, text: str) -> None:
+    parts = text.split()
+    action = parts[1] if len(parts) > 1 else "list"
+    argument = parts[2] if len(parts) > 2 else None
+    try:
+        if action == "list" and argument is None:
+            renderer.mcp_status(session.mcp_status(), session.mcp_config_errors())
+        elif action == "tools" and len(parts) <= 3:
+            renderer.mcp_tools(session.mcp_tools(argument))
+        elif action == "enable" and argument and len(parts) == 3:
+            renderer.mcp_status([session.mcp_enable(argument)], [])
+        elif action == "disable" and argument and len(parts) == 3:
+            renderer.mcp_status([session.mcp_disable(argument)], [])
+        elif action == "reload" and len(parts) <= 3:
+            renderer.mcp_status(session.mcp_reload(argument), session.mcp_config_errors())
+        else:
+            console.print(
+                Text(
+                    "Usage: /mcp list | tools [SERVER] | enable SERVER | "
+                    "disable SERVER | reload [SERVER]",
+                    style="yellow",
+                )
+            )
+    except (KeyError, RuntimeError, ValueError) as exc:
+        message = exc.args[0] if isinstance(exc, KeyError) and exc.args else str(exc)
+        console.print(Text(f"MCP: {message}", style="yellow"))
+
+
 async def _interactive(manager: AgentSessionManager, session: AgentSession) -> None:
-    terminal = PromptSession[str]()
+    terminal = PromptSession[str](
+        completer=SlashCompleter(workspace=session.workspace),
+        key_bindings=_build_key_bindings(),
+        multiline=False,  # Enter sends; Ctrl+J inserts newline via bindings
+        enable_history_search=True,
+    )
     renderer.banner(session.session_id, session.current_model, session.workspace)
     with patch_stdout(raw=True):
         while True:
@@ -221,13 +397,254 @@ async def _interactive(manager: AgentSessionManager, session: AgentSession) -> N
                     _render_event(event)
             elif text == "/reload":
                 console.print(session.agent.reload_project_resources())
+            elif text == "/mcp" or text.startswith("/mcp "):
+                _handle_mcp_command(session, text)
             elif text == "/workspace":
                 console.print(str(session.workspace))
+            elif text == "/cost":
+                renderer.token_usage(session.token_usage)
+            elif text == "/status":
+                renderer.status(session)
+            elif text == "/clear":
+                session.agent.event_manager._backend._events.clear()  # noqa: SLF001
+                session.agent.event_manager._backend._active_tags.clear()  # noqa: SLF001
+                console.print(Text("Conversation history cleared.", style="dim"))
+            elif text.startswith("/model"):
+                requested_model = text.partition(" ")[2].strip()
+                if not requested_model:
+                    models_list = session.available_models
+                    current = session.current_model
+                    console.print(Text(f"Current model: {current}", style="cyan"))
+                    if len(models_list) > 1:
+                        console.print(
+                            Text(f"Available: {', '.join(models_list)}", style="dim")
+                        )
+                        console.print(
+                            Text("Use /model NAME to switch.", style="dim")
+                        )
+                else:
+                    try:
+                        new_model = session.switch_model(requested_model)
+                        console.print(
+                            Text(f"Switched to model: {new_model}", style="green")
+                        )
+                    except (ValueError, RuntimeError) as exc:
+                        console.print(Text(str(exc), style="yellow"))
+            elif text.startswith("/permissions"):
+                mode = text.partition(" ")[2].strip()
+                if not mode:
+                    perms = session.settings.permissions
+                    console.print(
+                        Text(
+                            f"file_read={perms.file_read} "
+                            f"file_write={perms.file_write} "
+                            f"shell={perms.shell}",
+                            style="cyan",
+                        )
+                    )
+                    console.print(
+                        Text("Use /permissions allow|ask|default to switch.", style="dim")
+                    )
+                else:
+                    try:
+                        session.switch_permissions(mode)
+                        console.print(
+                            Text(f"Permission mode set to: {mode}", style="green")
+                        )
+                    except ValueError as exc:
+                        console.print(Text(str(exc), style="yellow"))
+            elif text == "/export":
+                export_path = Path(f"nooa-session-{session.session_id}.jsonl")
+                events = session.replay()
+                with export_path.open("w", encoding="utf-8") as f:
+                    for ev in events:
+                        f.write(ev.model_dump_json() + "\n")
+                console.print(
+                    Text(f"Exported {len(events)} events to {export_path}", style="green")
+                )
+            elif text == "/review":
+                console.print(Text("⟳ Reviewing current diff…", style="dim italic"))
+                review_text = await session.review()
+                from rich.markdown import Markdown as Md
+
+                console.print(Md(review_text))
+            elif text.startswith("/plan"):
+                plan_task = text.partition(" ")[2].strip()
+                if not plan_task:
+                    console.print(
+                        Text("Usage: /plan <task description>", style="yellow")
+                    )
+                else:
+                    console.print(Text("⟳ Generating plan…", style="dim italic"))
+                    plan_text = await session.plan(plan_task)
+                    from rich.markdown import Markdown as Md
+
+                    console.print(Md(plan_text))
+                    console.print(
+                        Text(
+                            "\nSend the task text to execute, or refine with /plan again.",
+                            style="dim",
+                        )
+                    )
+            elif text.startswith("/search"):
+                query = text.partition(" ")[2].strip()
+                if not query:
+                    console.print(Text("Usage: /search <query>", style="yellow"))
+                else:
+                    console.print(Text(f"⟳ Searching: {query}…", style="dim italic"))
+                    results = await session.web_search(query)
+                    console.print(Text(results))
+            elif text.startswith("/goal"):
+                arg = text.partition(" ")[2].strip()
+                if not arg:
+                    # Show current goal status.
+                    goal = session.goal
+                    if goal is None:
+                        console.print(Text("No active goal. Use /goal <objective> to set one.", style="dim"))
+                    else:
+                        console.print(Text(
+                            f"Goal: {goal.objective}\n"
+                            f"Status: {goal.status} | Turns: {goal.turns_used}/{goal.turn_budget}\n"
+                            f"Last evaluation: {goal.last_evaluation[:200]}",
+                            style="cyan",
+                        ))
+                elif arg == "clear":
+                    session.clear_goal()
+                    console.print(Text("Goal cleared.", style="dim"))
+                else:
+                    # Parse optional --budget N
+                    budget = 10
+                    objective = arg
+                    if "--budget" in arg:
+                        parts = arg.rsplit("--budget", 1)
+                        objective = parts[0].strip()
+                        try:
+                            budget = int(parts[1].strip())
+                        except ValueError:
+                            pass
+                    goal = session.set_goal(objective, turn_budget=budget)
+                    console.print(Text(
+                        f"Goal set: {goal.objective}\n"
+                        f"Turn budget: {goal.turn_budget}. Agent will auto-continue until achieved.",
+                        style="green",
+                    ))
             elif text.startswith("/"):
                 console.print(Text("Unknown command. Use /help.", style="red"))
             else:
-                await _run_turn(session, text, terminal, allow_controls=True)
+                expanded = _expand_at_mentions(text, session.workspace)
+                await _run_turn(session, expanded, terminal, allow_controls=True)
+                # Goal-driven reconcile loop: auto-continue until achieved.
+                while session.goal is not None and session.goal.status == "active":
+                    last_events = session.replay()
+                    turn_results = [
+                        e for e in last_events if e.name == "turn_finished"
+                    ]
+                    if not turn_results:
+                        break
+                    last_data = turn_results[-1].data.get("result", {})
+                    from .agent import CodingTaskResult as _CTR
+
+                    last_result = _CTR.model_validate(last_data)
+                    console.print(Text(
+                        f"⟳ Evaluating goal ({session.goal.turns_used + 1}/{session.goal.turn_budget})…",
+                        style="dim italic",
+                    ))
+                    achieved, evaluation = await session.evaluate_goal(last_result)
+                    if achieved:
+                        console.print(Text(
+                            f"✓ Goal achieved: {evaluation}",
+                            style="bold green",
+                        ))
+                        break
+                    if session.goal.status != "active":
+                        console.print(Text(
+                            f"Goal loop ended: {evaluation}",
+                            style="yellow",
+                        ))
+                        break
+                    # Extract next action from evaluation.
+                    next_action = evaluation
+                    if "NOT_ACHIEVED:" in evaluation:
+                        next_action = evaluation.split("NOT_ACHIEVED:", 1)[1].strip()
+                    console.print(Text(
+                        f"→ Not yet achieved. Continuing: {next_action[:150]}",
+                        style="dim",
+                    ))
+                    continuation = (
+                        f"Continue working toward the goal: {session.goal.objective}\n\n"
+                        f"Evaluator feedback: {next_action}"
+                    )
+                    await _run_turn(session, continuation, terminal, allow_controls=True)
     await session.close()
+
+
+def _run_doctor(repo: Path, settings: CodingSettings, settings_file: Path | None) -> None:
+    """Run environment diagnostics and print a health report."""
+    import shutil
+    import subprocess
+
+    from rich.table import Table as RichTable
+
+    table = RichTable(title="nooa-code doctor", show_header=True)
+    table.add_column("Check", style="bold")
+    table.add_column("Status")
+    table.add_column("Detail", style="dim")
+
+    # Git
+    git_path = shutil.which("git")
+    if git_path:
+        try:
+            ver = subprocess.run(["git", "--version"], capture_output=True, text=True, check=True)
+            table.add_row("git", "✓", ver.stdout.strip())
+        except subprocess.CalledProcessError:
+            table.add_row("git", "✗", "git found but --version failed")
+    else:
+        table.add_row("git", "✗", "not found in PATH")
+
+    # Repo is a git repository
+    git_dir = repo / ".git"
+    if git_dir.exists():
+        table.add_row("repository", "✓", str(repo))
+    else:
+        table.add_row("repository", "✗", f"{repo} is not a git repo")
+
+    # Models configured
+    if settings.models:
+        names = ", ".join(m.name for m in settings.models)
+        table.add_row("models", "✓", names)
+    else:
+        table.add_row("models", "✗", "no models configured")
+
+    # Settings file
+    from .config import settings_paths
+
+    found = settings_paths(repo, settings_file)
+    if found:
+        table.add_row("settings", "✓", ", ".join(str(p) for p in found))
+    else:
+        table.add_row("settings", "⚠", "no settings file found (using defaults)")
+
+    # Sessions directory
+    sessions_path = settings.sessions_path()
+    table.add_row("sessions_dir", "✓" if sessions_path.is_dir() else "⚠", str(sessions_path))
+
+    # Worktrees directory
+    worktrees_path = settings.worktrees_path()
+    table.add_row("worktrees_dir", "✓" if worktrees_path.is_dir() else "⚠", str(worktrees_path))
+
+    # Verification commands
+    if settings.verification_commands:
+        table.add_row("verification", "✓", f"{len(settings.verification_commands)} command(s)")
+    else:
+        table.add_row("verification", "⚠", "none configured")
+
+    # MCP
+    if settings.mcp.enabled:
+        table.add_row("mcp", "✓", f"servers: {settings.mcp.enabled_servers}")
+    else:
+        table.add_row("mcp", "⚠", "disabled")
+
+    console.print(table)
 
 
 @click.command()
@@ -243,7 +660,15 @@ async def _interactive(manager: AgentSessionManager, session: AgentSession) -> N
 @click.option("--session", "session_id", help="Create or resume this session id.")
 @click.option("--resume", is_flag=True, help="Require an existing session.")
 @click.option("--task", help="Run one task and exit instead of opening the TUI.")
-@click.option("--yes", is_flag=True, help="Auto-approve non-denied file and shell operations.")
+@click.option(
+    "--yes",
+    is_flag=True,
+    help="Auto-approve non-denied file, shell, and MCP operations.",
+)
+@click.option("--json", "output_json", is_flag=True, help="Output result as JSON (implies --task).")
+@click.option("--image", "images", multiple=True, type=click.Path(exists=True, dir_okay=False, path_type=Path), help="Attach image file(s) for multimodal input.")
+@click.option("--verbose", is_flag=True, help="Enable verbose debug logging.")
+@click.option("--doctor", is_flag=True, help="Run environment diagnostics and exit.")
 @click.option("--list-sessions", is_flag=True, help="List project sessions and exit.")
 def main(
     repo: Path,
@@ -254,22 +679,38 @@ def main(
     resume: bool,
     task: str | None,
     yes: bool,
+    output_json: bool,
+    images: tuple[Path, ...],
+    verbose: bool,
+    doctor: bool,
     list_sessions: bool,
 ) -> None:
-    """Run the local, worktree-isolated NOOA Coding Agent."""
+    """Run the local, worktree-isolated NOOA Coding Agent.
+
+    Pipe stdin to inject additional context:
+
+        cat error.log | nooa-code --task "diagnose this" --yes
+    """
     try:
+        if verbose:
+            import logging
+
+            logging.basicConfig(level=logging.DEBUG, format="%(name)s %(levelname)s: %(message)s")
+
         settings = load_settings(repo, settings_file)
+
+        if doctor:
+            _run_doctor(repo, settings, settings_file)
+            return
+
         if models:
             settings = settings.model_copy(
                 update={
                     "models": tuple(ModelEndpoint(name=name, api_base=api_base) for name in models)
                 }
             )
-        if yes:
-            permissions = settings.permissions.model_copy(
-                update={"file_read": "allow", "file_write": "allow", "shell": "allow"}
-            )
-            settings = settings.model_copy(update={"permissions": permissions})
+        if yes or output_json:
+            settings = _auto_approve(settings)
         manager = AgentSessionManager(repo, settings)
         if list_sessions:
             click.echo(
@@ -289,11 +730,45 @@ def main(
         else:
             session = manager.create(session_id)
 
+        # Read piped stdin as additional context.
+        stdin_context = ""
+        import sys
+
+        if not sys.stdin.isatty():
+            stdin_context = sys.stdin.read().strip()
+
+        effective_task = task
+        if stdin_context and effective_task:
+            effective_task = f"{effective_task}\n\n--- Piped context ---\n{stdin_context}"
+        elif stdin_context and not effective_task:
+            effective_task = stdin_context
+
+        # Attach image descriptions for multimodal context.
+        if images and effective_task:
+            import base64
+
+            image_parts: list[str] = []
+            for img_path in images:
+                try:
+                    data = base64.b64encode(img_path.read_bytes()).decode()
+                    suffix = img_path.suffix.lstrip(".").lower() or "png"
+                    mime = {"jpg": "jpeg", "svg": "svg+xml"}.get(suffix, suffix)
+                    image_parts.append(
+                        f"[Image: {img_path.name}](data:image/{mime};base64,{data[:100]}...)"
+                    )
+                except OSError:
+                    image_parts.append(f"[Image: {img_path.name} (unreadable)]")
+            effective_task = f"{effective_task}\n\n--- Attached images ---\n" + "\n".join(image_parts)
+
         async def run() -> None:
-            if task:
+            if output_json and effective_task:
+                result = await session.prompt(effective_task)
+                click.echo(result.model_dump_json(indent=2))
+                await session.close()
+            elif effective_task:
                 terminal = PromptSession[str]()
                 with patch_stdout(raw=True):
-                    await _run_turn(session, task, terminal, allow_controls=not yes)
+                    await _run_turn(session, effective_task, terminal, allow_controls=not yes)
                 await session.close()
             else:
                 await _interactive(manager, session)

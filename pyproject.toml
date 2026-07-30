@@ -7,24 +7,23 @@ license = { text = "Apache-2.0" }
 requires-python = ">=3.12,<3.14"
 dependencies = [
     "click>=8.1",
-    "nooa",
-    "nooa-cli[ast]",
-    "nooa-memory",
+    "nooa[mcp]>=0.0.8",
+    "nooa-cli[ast]>=0.0.8",
+    "nooa-memory>=0.0.8",
     "prompt-toolkit>=3.0",
     "pydantic>=2.5",
     "pyyaml>=6.0",
     "rich>=13.0",
+    "mcp>=1,<2",
 ]
 
 [project.scripts]
 nooa-code = "nooa_coding.cli:main"
 
-[tool.uv.sources]
-# NOOA is deliberately pinned. Upstream fetches do not change this application;
-# upgrades are explicit lockfile changes followed by the compatibility suite.
-nooa = { git = "https://github.com/NVIDIA-NeMo/labs-OO-Agents.git", rev = "f22805b52ea8a073dabc018cefe3db1ccf609a29" }
-nooa-cli = { git = "https://github.com/NVIDIA-NeMo/labs-OO-Agents.git", rev = "f22805b52ea8a073dabc018cefe3db1ccf609a29", subdirectory = "packages/nooa-cli" }
-nooa-memory = { git = "https://github.com/NVIDIA-NeMo/labs-OO-Agents.git", rev = "f22805b52ea8a073dabc018cefe3db1ccf609a29", subdirectory = "packages/nooa-memory" }
+# NOOA packages are consumed from PyPI (>=0.0.8). To pin a specific git rev instead,
+# add entries under [tool.uv.sources] pointing to the NVIDIA-NeMo/labs-OO-Agents repo.
+# Upgrade: `uv lock --upgrade-package nooa --upgrade-package nooa-cli --upgrade-package nooa-memory`
+# then run the compatibility suite.
 
 [dependency-groups]
 dev = [

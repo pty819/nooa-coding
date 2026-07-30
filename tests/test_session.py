@@ -6,11 +6,13 @@ from pathlib import Path
 
 import pytest
 from conftest import coding_response, fake_llm, response_with_code
+from nooa import build_prompt_data
 from nooa.agentdoc import doc
 from nooa.events import Message, Summary
 from nooa.unifiedllm import FakeLLMClient, LLMResponse
 
 from nooa_coding.config import CompactionSettings, PermissionSettings
+from nooa_coding.events import TokenUsage
 from nooa_coding.session import AgentSessionManager
 
 
@@ -58,6 +60,32 @@ async def test_model_identity_comes_from_live_session_without_an_llm_call(
         agent_api = doc(session.agent)
         assert "notify" in agent_api
         assert "message(" not in agent_api
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_system_prompt_explains_identity_capabilities_and_config(
+    git_repo: Path, settings
+) -> None:
+    manager = AgentSessionManager(git_repo, settings)
+    session = manager.create("system-context", llm=FakeLLMClient(scripted_responses=[]))
+    try:
+        prompt = await build_prompt_data(
+            session.agent._inspect_repository,  # pyright: ignore[reportPrivateUsage]
+            "inspect the runtime identity",
+        )
+        system = prompt.system_prompt or ""
+
+        assert "NOOA Coding Agent runtime" in system
+        assert f"<nooa-active-model>{session.current_model}</nooa-active-model>" in system
+        assert str(session.workspace) in system
+        assert "doc(self)" in system
+        assert ".nooa-coding/settings.yaml" in system
+        assert "AGENTS.md" in system
+        assert ".mcp.json" in system
+        assert ".codex/skills" in system
+        assert "Global files under `~/.config/nooa-coding`" in system
     finally:
         await session.close()
 
@@ -261,5 +289,280 @@ async def test_agents_and_skills_are_loaded_from_worktree(git_repo: Path, settin
         assert "cmd.fixture-skill" in session.agent.skills.activated()
         rendered = str(session.agent.context_manager["project_instructions"])
         assert "Always run fixture checks" in rendered
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_token_usage_accumulates_from_llm_complete_events(
+    git_repo: Path, settings
+) -> None:
+    """Token usage is tracked from LLMComplete runtime events."""
+    manager = AgentSessionManager(git_repo, settings)
+    session = manager.create("usage", llm=fake_llm(coding_response()))
+    try:
+        # Before any LLM call, usage is zero.
+        assert session.token_usage.llm_calls == 0
+        assert session.token_usage.total_tokens == 0
+
+        await session.prompt("create the fixture output")
+
+        # FakeLLMClient doesn't emit LLMComplete events with usage data,
+        # so usage stays zero — but the property must not raise.
+        usage = session.token_usage
+        assert isinstance(usage, TokenUsage)
+        assert usage.total_cost_usd >= 0
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_thinking_events_are_emitted_during_turn(git_repo: Path, settings) -> None:
+    """LLMCallStart/End from NOOA runtime are forwarded as thinking events."""
+    manager = AgentSessionManager(git_repo, settings)
+    session = manager.create("thinking", llm=fake_llm(coding_response()))
+    try:
+        await session.prompt("create the fixture output")
+
+        events = session.replay()
+        # The FakeLLMClient triggers the runtime which emits LLMCallStart/End.
+        # These should appear as 'thinking' kind events in the session trace.
+        thinking_events = [e for e in events if e.kind == "thinking"]
+        # At minimum, the codeact loop fires at least one LLM call.
+        started = [e for e in thinking_events if e.name == "llm_call_started"]
+        ended = [e for e in thinking_events if e.name == "llm_call_ended"]
+        assert len(started) >= 1
+        assert len(ended) >= 1
+        # Each started event carries method and turn info.
+        assert started[0].data.get("method") != ""
+        assert started[0].data.get("turn", 0) >= 1
+    finally:
+        await session.close()
+
+
+def test_token_usage_model_accumulates() -> None:
+    """Unit test for TokenUsage model arithmetic."""
+    usage = TokenUsage()
+    usage.add(prompt_tokens=100, completion_tokens=50, cost_usd=0.01)
+    usage.add(prompt_tokens=200, completion_tokens=80, cached_tokens=30, cost_usd=0.02)
+    assert usage.llm_calls == 2
+    assert usage.total_prompt_tokens == 300
+    assert usage.total_completion_tokens == 130
+    assert usage.total_cached_tokens == 30
+    assert usage.total_tokens == 430
+    assert abs(usage.total_cost_usd - 0.03) < 1e-9
+
+
+@pytest.mark.asyncio
+async def test_model_switch_changes_active_client(git_repo: Path, settings) -> None:
+    """Runtime model switching updates the active LLM client."""
+    from nooa_coding.llm import FailoverLLM
+
+    client_a = FakeLLMClient(scripted_responses=[])
+    client_a.model = "model-a"
+    client_b = FakeLLMClient(scripted_responses=[])
+    client_b.model = "model-b"
+    llm = FailoverLLM([client_a, client_b])
+
+    manager = AgentSessionManager(git_repo, settings)
+    session = manager.create("model-switch", llm=llm)
+    try:
+        assert session.current_model == "model-a"
+        assert session.available_models == ["model-a", "model-b"]
+
+        session.switch_model("model-b")
+        assert session.current_model == "model-b"
+        assert llm.active_index == 1
+
+        # Switching to unknown model raises ValueError.
+        with pytest.raises(ValueError, match="unknown model"):
+            session.switch_model("model-z")
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_permission_switch_updates_policy(git_repo: Path, settings) -> None:
+    """Runtime permission switching updates the policy settings."""
+    manager = AgentSessionManager(git_repo, settings)
+    session = manager.create("perm-switch", llm=FakeLLMClient(scripted_responses=[]))
+    try:
+        # Default from fixture: file_write=allow, shell=allow.
+        policy = session.agent.shell._policy  # noqa: SLF001
+        assert policy.settings.file_write == "allow"
+
+        session.switch_permissions("ask")
+        assert policy.settings.file_write == "ask"
+        assert policy.settings.shell == "ask"
+
+        session.switch_permissions("allow")
+        assert policy.settings.file_write == "allow"
+        assert policy.settings.shell == "allow"
+
+        with pytest.raises(ValueError, match="unknown permission mode"):
+            session.switch_permissions("yolo")
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_review_returns_no_changes_message_on_clean_worktree(
+    git_repo: Path, settings
+) -> None:
+    """Review on a clean worktree returns a friendly message without calling the LLM."""
+    manager = AgentSessionManager(git_repo, settings)
+    session = manager.create("review-clean", llm=FakeLLMClient(scripted_responses=[]))
+    try:
+        result = await session.review()
+        assert "No changes to review" in result
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_plan_generates_output(git_repo: Path, settings) -> None:
+    """Plan mode calls the LLM and returns content."""
+    from nooa.unifiedllm import LLMResponse
+
+    plan_response = LLMResponse(
+        raw_response=None,
+        content="# Plan\n1. Step one\n2. Step two",
+        tool_calls=[],
+        finish_reason="stop",
+        assistant_message={"role": "assistant", "content": "plan"},
+    )
+    manager = AgentSessionManager(git_repo, settings)
+    session = manager.create("plan-test", llm=fake_llm(plan_response))
+    try:
+        result = await session.plan("refactor the parser module")
+        assert "Plan" in result
+        assert "Step one" in result
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_delegate_parallel_runs_subtasks_in_forks(git_repo: Path, settings) -> None:
+    """delegate_parallel spawns child sessions that run independently."""
+    manager = AgentSessionManager(git_repo, settings)
+    session = manager.create("parent", llm=fake_llm(coding_response()))
+    try:
+        results = await manager.delegate_parallel(
+            session,
+            ["create the fixture output", "create the fixture output"],
+            llm_factory=lambda: fake_llm(coding_response()),
+        )
+        assert len(results) == 2
+        assert all(r["status"] == "completed" for r in results)
+        assert results[0]["session_id"] == "parent-sub0"
+        assert results[1]["session_id"] == "parent-sub1"
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_goal_set_evaluate_and_achieve(git_repo: Path, settings) -> None:
+    """Goal mode: set goal, run turn, evaluator confirms achieved."""
+    from nooa.unifiedllm import LLMResponse
+
+    # First response: coding task result. Second: evaluator says ACHIEVED.
+    eval_response = LLMResponse(
+        raw_response=None,
+        content="ACHIEVED: all tests pass and lint is clean",
+        tool_calls=[],
+        finish_reason="stop",
+        assistant_message={"role": "assistant", "content": "eval"},
+    )
+    manager = AgentSessionManager(git_repo, settings)
+    session = manager.create(
+        "goal-test", llm=fake_llm(coding_response(), eval_response)
+    )
+    try:
+        # Set a goal.
+        goal = session.set_goal("all tests pass", turn_budget=5)
+        assert goal.status == "active"
+        assert goal.turn_budget == 5
+        assert session.goal is not None
+
+        # Run a turn.
+        result = await session.prompt("create the fixture output")
+        assert result.status == "completed"
+
+        # Evaluate the goal.
+        achieved, evaluation = await session.evaluate_goal(result)
+        assert achieved is True
+        assert "ACHIEVED" in evaluation
+        assert session.goal.status == "achieved"
+        assert session.goal.turns_used == 1
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_goal_not_achieved_continues(git_repo: Path, settings) -> None:
+    """Goal mode: evaluator says NOT_ACHIEVED, goal stays active."""
+    from nooa.unifiedllm import LLMResponse
+
+    eval_response = LLMResponse(
+        raw_response=None,
+        content="NOT_ACHIEVED: tests still failing in test_auth.py",
+        tool_calls=[],
+        finish_reason="stop",
+        assistant_message={"role": "assistant", "content": "eval"},
+    )
+    manager = AgentSessionManager(git_repo, settings)
+    session = manager.create(
+        "goal-continue", llm=fake_llm(coding_response(), eval_response)
+    )
+    try:
+        session.set_goal("all tests pass", turn_budget=5)
+        result = await session.prompt("fix the tests")
+
+        achieved, evaluation = await session.evaluate_goal(result)
+        assert achieved is False
+        assert "NOT_ACHIEVED" in evaluation
+        assert session.goal.status == "active"
+        assert session.goal.turns_used == 1
+        assert session.goal.turns_remaining == 4
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_goal_budget_exhaustion(git_repo: Path, settings) -> None:
+    """Goal mode: budget exhaustion stops the loop without calling LLM."""
+    from nooa_coding.agent import CodingTaskResult
+
+    manager = AgentSessionManager(git_repo, settings)
+    session = manager.create("goal-exhaust", llm=FakeLLMClient(scripted_responses=[]))
+    try:
+        session.set_goal("impossible goal", turn_budget=2)
+        # Simulate prior turns used up the budget.
+        session.goal.turns_used = 2
+
+        mock_result = CodingTaskResult(
+            mode="change",
+            status="completed",
+            summary="did something",
+            evidence="some evidence",
+        )
+        achieved, evaluation = await session.evaluate_goal(mock_result)
+        assert achieved is False
+        assert "exhausted" in evaluation.lower()
+        assert session.goal.status == "exhausted"
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_goal_clear(git_repo: Path, settings) -> None:
+    """Goal mode: clear removes the active goal."""
+    manager = AgentSessionManager(git_repo, settings)
+    session = manager.create("goal-clear", llm=FakeLLMClient(scripted_responses=[]))
+    try:
+        session.set_goal("some objective")
+        assert session.goal is not None
+        session.clear_goal()
+        assert session.goal is None
     finally:
         await session.close()

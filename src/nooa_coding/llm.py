@@ -11,6 +11,7 @@ from nooa.unifiedllm import LLMResponse, Tool, UnifiedLLM, get_llm_client
 from pydantic import BaseModel
 
 from .config import ModelEndpoint
+from .system_prompt import bind_active_model
 
 # Suppress litellm's noisy "Provider List" and debug banners for custom models.
 litellm.suppress_debug_info = True
@@ -70,10 +71,12 @@ class FailoverLLM(UnifiedLLM):
         errors: list[Exception] = []
         order = self._ordered_indices()
         for position, index in enumerate(order):
+            client = self.clients[index]
+            self.active_index = index
+            self.model = client.model
             try:
-                response = self.clients[index].call(messages, tools, output_model, **kwargs)
-                self.active_index = index
-                self.model = self.clients[index].model
+                bound_messages = bind_active_model(messages, client.model)
+                response = client.call(bound_messages, tools, output_model, **kwargs)
                 return response
             except Exception as exc:
                 errors.append(exc)
@@ -93,10 +96,12 @@ class FailoverLLM(UnifiedLLM):
         errors: list[Exception] = []
         order = self._ordered_indices()
         for position, index in enumerate(order):
+            client = self.clients[index]
+            self.active_index = index
+            self.model = client.model
             try:
-                response = await self.clients[index].acall(messages, tools, output_model, **kwargs)
-                self.active_index = index
-                self.model = self.clients[index].model
+                bound_messages = bind_active_model(messages, client.model)
+                response = await client.acall(bound_messages, tools, output_model, **kwargs)
                 return response
             except Exception as exc:
                 errors.append(exc)

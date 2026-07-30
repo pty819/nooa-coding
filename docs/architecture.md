@@ -29,6 +29,20 @@ Before and after every prompt, the agent snapshot is saved. Metadata is marked
 that state, restores the latest snapshot, preserves the worktree, and records a
 crash-recovery event.
 
+## Runtime system context
+
+Every generation receives a dynamic host-owned system block. It identifies the
+NOOA Coding Agent product, the model receiving that particular provider call,
+the isolated worktree, capability discovery through `doc(self)`, and the
+supported project configuration, instruction, skill, and MCP files. The block
+also distinguishes project-scoped files from global configuration outside the
+worktree and from nooa-coding's own product source documentation.
+
+The active-model field is tagged in the rendered context. `FailoverLLM` binds
+that field immediately before each provider attempt, so a secondary model never
+receives a stale primary-model identity. Final task results read the active model
+after generation for the same reason.
+
 ## Turn routing and completion authority
 
 The application routes each request before giving it tools:
@@ -45,6 +59,26 @@ the worktree before and after model execution, derives changed paths from Git,
 runs `git diff --check`, and then runs configured or policy-approved behavioral
 checks. A model-authored claim or file list cannot by itself produce a
 `completed` result.
+
+## External MCP clients
+
+NOOA's public `MCPManager` owns protocol transports, OAuth, server discovery,
+JSON-schema conversion, and dynamic tool generation. The nooa-coding
+`MCPRuntime` owns the application lifecycle around it:
+
+1. merge user, repository, and inline MCP server definitions;
+2. select explicitly enabled servers and isolate connection failures;
+3. wrap the generated methods with approval, inspection-mode, timeout, output,
+   and event policy;
+4. inject each server as `self.mcp_<normalized-server-name>`;
+5. expose status, tools, enable, disable, and reload through `AgentSession` and
+   the terminal client.
+
+MCP is opt-in because connecting a stdio server executes its configured local
+command. Configuration secrets use environment-variable placeholders. Durable
+events retain server/tool names and argument names, but not argument values or
+resolved credentials. MCP protocol implementation remains entirely upstream;
+nooa-coding only consumes its public client API.
 
 ## State separation
 

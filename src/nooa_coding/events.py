@@ -16,6 +16,8 @@ SessionEventKind = Literal[
     "approval",
     "checkpoint",
     "model_failover",
+    "thinking",
+    "usage",
     "error",
 ]
 
@@ -31,4 +33,35 @@ class SessionEvent(BaseModel):
     data: dict[str, Any] = Field(default_factory=dict)
 
 
-__all__ = ["SessionEvent", "SessionEventKind"]
+class TokenUsage(BaseModel):
+    """Cumulative token usage statistics for one session."""
+
+    total_prompt_tokens: int = 0
+    total_completion_tokens: int = 0
+    total_cached_tokens: int = 0
+    total_reasoning_tokens: int = 0
+    total_cost_usd: float = 0.0
+    llm_calls: int = 0
+
+    def add(
+        self,
+        *,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        cached_tokens: int = 0,
+        reasoning_tokens: int = 0,
+        cost_usd: float = 0.0,
+    ) -> None:
+        self.total_prompt_tokens += prompt_tokens
+        self.total_completion_tokens += completion_tokens
+        self.total_cached_tokens += cached_tokens
+        self.total_reasoning_tokens += reasoning_tokens
+        self.total_cost_usd += cost_usd
+        self.llm_calls += 1
+
+    @property
+    def total_tokens(self) -> int:
+        return self.total_prompt_tokens + self.total_completion_tokens
+
+
+__all__ = ["SessionEvent", "SessionEventKind", "TokenUsage"]

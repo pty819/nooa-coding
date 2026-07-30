@@ -14,6 +14,8 @@ upstream fetch or checkout cannot silently change agent behavior.
 - file and shell approval policies;
 - diff, checkpoint, and rollback operations;
 - layered project settings, `AGENTS.md`, and `SKILL.md` discovery;
+- live system context describing agent identity, active model, capabilities, and configuration;
+- external MCP client support with registration, policy, and tool injection;
 - resource limits, durable replay traces, and ordered model failover.
 
 The application is intentionally local. It does not contain a service layer,
@@ -55,12 +57,58 @@ await session.close()
 The same API supports `prompt()`, `cancel()`, `compact()`, `diff()`,
 `rollback()`, `replay()`, `resume()`, and project-scoped session listing.
 
+Every model generation receives a host-owned runtime system context identifying
+NOOA Coding Agent, the model actually receiving that provider call, the isolated
+worktree, the visible-capability discovery contract, and the supported locations
+for project settings, instructions, skills, and MCP configuration. Model failover
+rewrites the identity for the receiving model instead of retaining the failed
+provider's name.
+
+## External MCP servers
+
+`nooa-code` is an MCP client/host. It consumes external MCP servers; it does
+not expose the coding agent itself as an MCP server. Server definitions use the
+standard `.mcp.json` shape and may live in the target repository or in
+`~/.config/nooa-coding/mcp.json`.
+
+MCP is disabled by default because a stdio server launches a local process.
+Enable only reviewed servers in `.nooa-coding/settings.yaml`:
+
+```yaml
+coding_agent:
+  mcp:
+    enabled: true
+    enabled_servers: [docs]
+    permissions:
+      default: ask
+      allow: ["docs.search*", "docs.get*"]
+      read_only: ["docs.search*", "docs.get*"]
+      deny: ["*.delete*", "*.destroy*"]
+```
+
+Secrets should use `${ENV_VAR}` placeholders in `.mcp.json`; resolved values
+are never written to durable MCP events. Connected servers are injected as
+`self.mcp_<server>` capabilities, for example
+`await self.mcp_docs.search(query="...")`.
+
+Use `/mcp list`, `/mcp tools [SERVER]`, `/mcp enable SERVER`,
+`/mcp disable SERVER`, and `/mcp reload [SERVER]` in the terminal. The Python
+API exposes the corresponding `mcp_status()`, `mcp_tools()`, `mcp_enable()`,
+`mcp_disable()`, and `mcp_reload()` session methods. See
+[`mcp.example.json`](mcp.example.json) for stdio and HTTP examples.
+
 ## Trust boundary
 
 Every session edits a dedicated Git worktree. File and shell operations exposed
 to the model pass through application-owned approval policy, timeout, and output
 limits. A CodeAct middleware also rejects common attempts to bypass those tools
 with direct Python file/process access.
+
+External MCP calls pass through a separate application-owned policy using
+`server.tool` glob patterns. Inspection turns can only use tools explicitly
+listed as `read_only`; other calls are denied even when their normal mode would
+be `allow`. Calls have a host timeout and retained-output cap, and arguments are
+not persisted in event values.
 
 These Python checks are guardrails, not an adversarial security sandbox. This
 release targets a trusted single user running local repositories. Running

@@ -19,7 +19,7 @@ from pydantic import BaseModel
 
 from .config import LimitSettings, PermissionMode, PermissionSettings
 
-ApprovalKind = Literal["file_read", "file_write", "shell"]
+ApprovalKind = Literal["file_read", "file_write", "shell", "mcp"]
 EventSink = Callable[[str, dict[str, Any]], None]
 
 

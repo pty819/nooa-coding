@@ -41,6 +41,28 @@ coding_agent:
     verification_timeout: 300
     max_output_chars: 100000
     max_stdin_chars: 1000000
+  mcp:
+    enabled: false
+    config_files:
+      - ~/.config/nooa-coding/mcp.json
+      - .mcp.json
+    enabled_servers: [docs]
+    disabled_servers: []
+    fail_on_error: false
+    call_timeout: 60
+    max_output_chars: 100000
+    permissions:
+      default: ask
+      allow:
+        - "docs.search*"
+        - "docs.get*"
+      read_only:
+        - "docs.search*"
+        - "docs.get*"
+      deny:
+        - "*.delete*"
+        - "*.destroy*"
+        - "*.drop*"
   resources:
     agents_files: [AGENTS.md]
     skills_dirs: [.codex/skills, .nooa/skills, .nooa-coding/skills]
