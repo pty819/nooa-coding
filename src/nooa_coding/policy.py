@@ -18,6 +18,7 @@ from nooa.tools.shell_tools import FileWrite, Match, ShellResult, ShellTools
 from pydantic import BaseModel
 
 from .config import LimitSettings, PermissionMode, PermissionSettings
+from .hooks import HookRunner
 
 ApprovalKind = Literal["file_read", "file_write", "shell", "mcp"]
 EventSink = Callable[[str, dict[str, Any]], None]
@@ -196,12 +197,15 @@ class PolicyShellTools(Skill):
         policy: PermissionPolicy,
         limits: LimitSettings,
         event_sink: EventSink,
+        *,
+        hook_runner: HookRunner | None = None,
     ) -> None:
         self.cwd = Path(cwd).resolve()
         self._shell = ShellTools(cwd=str(self.cwd))
         self._policy = policy
         self._limits = limits
         self._event_sink = event_sink
+        self._hook_runner = hook_runner
         self._operation_lock = asyncio.Lock()
         self._read_only_depth = 0
         super().__init__()
@@ -239,11 +243,24 @@ class PolicyShellTools(Skill):
                 "inspection mode only permits configured read-only shell commands"
             )
         await self._policy.shell(command)
+        # PreToolUse hook — can block execution.
+        if self._hook_runner:
+            pre = await self._hook_runner.trigger_pre_tool_use(
+                "Bash", tool_input=command
+            )
+            if not pre.allowed:
+                raise PermissionError(f"Hook blocked: {pre.block_reason}")
         effective_timeout = min(
             timeout or self._limits.command_timeout, self._limits.command_timeout
         )
         async with self._operation_lock:
-            return await self._execute(command, stdin=stdin, timeout=effective_timeout)
+            result = await self._execute(command, stdin=stdin, timeout=effective_timeout)
+        # PostToolUse hook.
+        if self._hook_runner:
+            await self._hook_runner.trigger_post_tool_use(
+                "Bash", tool_input=command, tool_output=result.stdout[:2000]
+            )
+        return result
 
     async def _run_trusted(self, command: str, *, timeout: float) -> ShellResult:
         """Run an application-configured verification command without prompting."""
@@ -297,8 +314,19 @@ class PolicyShellTools(Skill):
     ) -> Match:
         """Read a policy-approved file inside the isolated worktree."""
         await self._policy.file_read(path)
+        if self._hook_runner:
+            pre = await self._hook_runner.trigger_pre_tool_use(
+                "Read", tool_input=path, file_path=path
+            )
+            if not pre.allowed:
+                raise PermissionError(f"Hook blocked: {pre.block_reason}")
         async with self._operation_lock:
-            return await self._shell.read(path, lines=lines)
+            result = await self._shell.read(path, lines=lines)
+        if self._hook_runner:
+            await self._hook_runner.trigger_post_tool_use(
+                "Read", tool_input=path, file_path=path
+            )
+        return result
 
     async def replace(
         self,
@@ -311,12 +339,22 @@ class PolicyShellTools(Skill):
         if self._read_only_depth:
             raise PermissionError("inspection mode cannot modify files")
         await self._policy.file_write(path)
+        if self._hook_runner:
+            pre = await self._hook_runner.trigger_pre_tool_use(
+                "Edit", tool_input=path, file_path=path
+            )
+            if not pre.allowed:
+                raise PermissionError(f"Hook blocked: {pre.block_reason}")
         async with self._operation_lock:
             result = await self._shell.replace(target, old_or_new, new)
         diff_snippet = self._make_diff_snippet(result.path, old_or_new, new or "")
         self._event_sink(
             "file_changed", {"path": result.path, "operation": "replace", "diff": diff_snippet}
         )
+        if self._hook_runner:
+            await self._hook_runner.trigger_post_tool_use(
+                "Edit", tool_input=path, file_path=result.path, tool_output=diff_snippet
+            )
         return result
 
     async def write_file(
@@ -330,12 +368,22 @@ class PolicyShellTools(Skill):
         if self._read_only_depth:
             raise PermissionError("inspection mode cannot modify files")
         await self._policy.file_write(path)
+        if self._hook_runner:
+            pre = await self._hook_runner.trigger_pre_tool_use(
+                "Write", tool_input=path, file_path=path
+            )
+            if not pre.allowed:
+                raise PermissionError(f"Hook blocked: {pre.block_reason}")
         async with self._operation_lock:
             result = await self._shell.write_file(path, content)
         preview = content[:300] + ("…" if len(content) > 300 else "")
         self._event_sink(
             "file_changed", {"path": result.path, "operation": "write", "diff": preview}
         )
+        if self._hook_runner:
+            await self._hook_runner.trigger_post_tool_use(
+                "Write", tool_input=path, file_path=result.path
+            )
         return result
 
     @staticmethod

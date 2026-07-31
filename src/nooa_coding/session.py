@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field
 from .agent import CodingAgent, CodingTaskResult
 from .config import CodingSettings, load_settings
 from .events import SessionEvent, SessionEventKind, TokenUsage
+from .hooks import HookRunner, load_hooks_config
 from .learning import LessonExtractor, LessonStore, get_default_store
 from .llm import build_llm
 from .mcp import MCPServerStatus
@@ -109,11 +110,22 @@ class AgentSession:
 
         self.approvals = ApprovalManager(self._policy_event)
         policy = PermissionPolicy(settings.permissions, self.approvals)
+        hooks_config = load_hooks_config(
+            metadata.workspace.path,
+            settings_hooks=getattr(settings, "hooks", None),
+        )
+        self._hook_runner = HookRunner(
+            hooks_config,
+            workspace=metadata.workspace.path,
+            session_id=metadata.session_id,
+            event_sink=self._tool_event,
+        )
         shell = PolicyShellTools(
             metadata.workspace.path,
             policy,
             settings.limits,
             self._tool_event,
+            hook_runner=self._hook_runner,
         )
         self.llm = llm or build_llm(settings.models, on_failover=self._model_failover)
         self.storage = SQLiteStorageManager(self.database_path)
@@ -132,6 +144,11 @@ class AgentSession:
         if restore:
             self.storage.restore_latest_snapshot(self.agent)
         self._persist_metadata()
+
+    async def _fire_session_start(self) -> None:
+        """Fire SessionStart hooks. Called once after construction."""
+        with contextlib.suppress(Exception):
+            await self._hook_runner.trigger_session_start()
 
     @property
     def session_id(self) -> str:
@@ -561,6 +578,13 @@ class AgentSession:
             payload = {"text": str(event)}
         kind: SessionEventKind = "message" if isinstance(event, AgentMessage) else "agent"
         self._emit(kind, event_type, payload)
+        # Notification hook for agent messages.
+        if isinstance(event, AgentMessage):
+            text = getattr(event, "text", "") or str(event)
+            with contextlib.suppress(Exception):
+                asyncio.get_event_loop().create_task(
+                    self._hook_runner.trigger_notification(text)
+                )
 
     def _save_snapshot(self) -> str:
         snapshot_id = self.storage.save_snapshot(self.agent)
@@ -610,6 +634,9 @@ class AgentSession:
                     "turn_finished",
                     {"run_id": run_id, "result": result.model_dump(mode="json")},
                 )
+                # Stop hook — runs after agent finishes.
+                with contextlib.suppress(Exception):
+                    await self._hook_runner.trigger_stop(summary=result.summary)
                 return result
             finally:
                 self._active_task = None
