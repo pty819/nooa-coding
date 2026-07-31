@@ -26,7 +26,10 @@ def render_runtime_system_context(*, active_model: str, worktree: Path) -> str:
 - Inspect `doc(self)` when you need the exact current API. Call only visible public `self.*`
   methods and fields; private names beginning with `_` are host internals and are blocked.
 - Await asynchronous capabilities. Stable capability groups include `self.shell`, `self.repo`,
-  `self.todo`, `self.skills`, `self.context`, and `self.events`. Memory methods are present when
+  `self.todo`, `self.skills`, `self.search`, `self.lsp`, `self.context`, and `self.events`.
+  `self.search` provides fast codebase search (content search, file finding, symbol outlines).
+  `self.lsp` provides code intelligence (definitions, references, symbol search).
+  Memory methods are present when
   memory is enabled. Connected external MCP servers appear dynamically as
   `self.mcp_<normalized_server_name>` and their exact signatures are in `doc(self)`.
 - Use provided capabilities instead of direct filesystem, subprocess, socket, or HTTP access.

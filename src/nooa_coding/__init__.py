@@ -2,6 +2,7 @@
 
 from .config import CodingSettings, MCPPermissionSettings, MCPSettings, load_settings
 from .mcp import MCPServerStatus
+from .plugin import Plugin, PluginRegistry
 from .session import AgentSession, AgentSessionManager, GoalState
 
 __all__ = [
@@ -12,5 +13,7 @@ __all__ = [
     "MCPPermissionSettings",
     "MCPServerStatus",
     "MCPSettings",
+    "Plugin",
+    "PluginRegistry",
     "load_settings",
 ]

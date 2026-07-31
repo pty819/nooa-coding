@@ -22,8 +22,10 @@ from pydantic import BaseModel, Field
 from .agent import CodingAgent, CodingTaskResult
 from .config import CodingSettings, load_settings
 from .events import SessionEvent, SessionEventKind, TokenUsage
+from .learning import LessonExtractor, LessonStore, get_default_store
 from .llm import build_llm
 from .mcp import MCPServerStatus
+from .multi_agent import Orchestrator
 from .policy import ApprovalManager, PermissionPolicy, PolicyShellTools
 from .workspace import Checkpoint, DiffResult, WorkspaceInfo, WorkspaceManager
 
@@ -101,6 +103,9 @@ class AgentSession:
         self._closed = False
         self._token_usage = TokenUsage()
         self._goal: GoalState | None = None
+        self._orchestrator: Orchestrator | None = None
+        self._lesson_store: LessonStore | None = None
+        self._lesson_extractor: LessonExtractor | None = None
 
         self.approvals = ApprovalManager(self._policy_event)
         policy = PermissionPolicy(settings.permissions, self.approvals)
@@ -222,6 +227,54 @@ class AgentSession:
         self._emit("session", "plan_generated", {"task": task[:200]})
         return response.content or "Plan produced no output."
 
+    async def suggest(self, task: str) -> str:
+        """Generate a concrete diff suggestion without executing any changes."""
+        diff = WorkspaceManager.diff(self.workspace)
+        context_parts: list[str] = []
+        if diff.patch.strip():
+            context_parts.append(f"Current uncommitted changes:\n```diff\n{diff.patch[:20000]}\n```")
+        suggest_prompt = (
+            "You are a code suggestion engine. The user wants the following change.\n"
+            "Produce a CONCISE unified diff showing exactly what to modify.\n"
+            "Rules:\n"
+            "- Output ONLY the diff blocks (```diff ... ```), no prose.\n"
+            "- Use real file paths from the repository.\n"
+            "- Keep changes minimal and focused.\n"
+            "- If you need more context, output a brief question instead.\n\n"
+            f"Task: {task}\n\n"
+            + "\n".join(context_parts)
+        )
+        messages = [{"role": "user", "content": suggest_prompt}]
+        response = await self.llm.acall(messages)
+        self._track_direct_llm_call(response)
+        self._emit("session", "suggest_completed", {"task": task[:200]})
+        return response.content or "No suggestion produced."
+
+    async def stream_direct(self, prompt: str) -> AsyncIterator[str]:
+        """Stream a direct LLM response token-by-token using litellm."""
+        import litellm
+
+        active = getattr(self.llm, "active", self.llm)
+        model = str(getattr(active, "model", getattr(self.llm, "model", "")))
+        api_base = getattr(active, "api_base", None) or getattr(
+            getattr(active, "config", {}), "get", lambda *_: None
+        )("api_base")
+        kwargs: dict[str, Any] = {"model": model, "stream": True}
+        if api_base:
+            kwargs["api_base"] = api_base
+        api_key = getattr(active, "api_key", None)
+        if api_key:
+            kwargs["api_key"] = api_key
+
+        response = await litellm.acompletion(
+            messages=[{"role": "user", "content": prompt}],
+            **kwargs,
+        )
+        async for chunk in response:
+            delta = chunk.choices[0].delta if chunk.choices else None
+            if delta and delta.content:
+                yield delta.content
+
     async def web_search(self, query: str) -> str:
         """Search the web and return summarized results."""
         import urllib.parse
@@ -261,6 +314,46 @@ class AgentSession:
         return f"Web search results for '{query}':\n\n" + "\n".join(results)
 
     # ─── Goal mode ───────────────────────────────────────────────────────────
+
+    @property
+    def orchestrator(self) -> Orchestrator:
+        """Lazy-initialized multi-agent orchestrator for this session."""
+        if self._orchestrator is None:
+            self._orchestrator = Orchestrator(self)
+        return self._orchestrator
+
+    @property
+    def lesson_store(self) -> LessonStore:
+        """Lazy-initialized cross-session lesson store."""
+        if self._lesson_store is None:
+            self._lesson_store = get_default_store()
+        return self._lesson_store
+
+    @property
+    def lesson_extractor(self) -> LessonExtractor:
+        """Lazy-initialized lesson extractor."""
+        if self._lesson_extractor is None:
+            self._lesson_extractor = LessonExtractor(self.lesson_store, self.llm)
+        return self._lesson_extractor
+
+    async def learn_from_failure(
+        self, task: str, error: str, evidence: str = ""
+    ) -> None:
+        """Extract and store a lesson from a failed task."""
+        lesson = await self.lesson_extractor.extract_from_failure(
+            task, error, evidence, session_id=self.session_id
+        )
+        if lesson:
+            self._emit(
+                "session",
+                "lesson_learned",
+                {"title": lesson.title, "category": lesson.category},
+            )
+
+    def recall_lessons(self, task: str, limit: int = 3) -> str:
+        """Recall relevant lessons for a task, formatted as context."""
+        lessons = self.lesson_extractor.recall_relevant(task, limit=limit)
+        return self.lesson_extractor.format_for_context(lessons)
 
     @property
     def goal(self) -> GoalState | None:
@@ -506,6 +599,9 @@ class AgentSession:
                     "turn_failed",
                     {"run_id": run_id, "type": type(exc).__name__, "message": str(exc)},
                 )
+                # Auto-extract lesson from failure.
+                with contextlib.suppress(Exception):
+                    await self.learn_from_failure(task, f"{type(exc).__name__}: {exc}")
                 raise
             else:
                 self._set_status("idle")

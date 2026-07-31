@@ -313,7 +313,10 @@ class PolicyShellTools(Skill):
         await self._policy.file_write(path)
         async with self._operation_lock:
             result = await self._shell.replace(target, old_or_new, new)
-        self._event_sink("file_changed", {"path": result.path, "operation": "replace"})
+        diff_snippet = self._make_diff_snippet(result.path, old_or_new, new or "")
+        self._event_sink(
+            "file_changed", {"path": result.path, "operation": "replace", "diff": diff_snippet}
+        )
         return result
 
     async def write_file(
@@ -329,8 +332,23 @@ class PolicyShellTools(Skill):
         await self._policy.file_write(path)
         async with self._operation_lock:
             result = await self._shell.write_file(path, content)
-        self._event_sink("file_changed", {"path": result.path, "operation": "write"})
+        preview = content[:300] + ("…" if len(content) > 300 else "")
+        self._event_sink(
+            "file_changed", {"path": result.path, "operation": "write", "diff": preview}
+        )
         return result
+
+    @staticmethod
+    def _make_diff_snippet(path: str, old: str, new: str) -> str:
+        """Build a compact unified-diff snippet for event rendering."""
+        old_lines = old.splitlines()[:6]
+        new_lines = new.splitlines()[:6]
+        parts: list[str] = []
+        for line in old_lines:
+            parts.append(f"- {line}")
+        for line in new_lines:
+            parts.append(f"+ {line}")
+        return "\n".join(parts[:12])
 
 
 __all__ = [

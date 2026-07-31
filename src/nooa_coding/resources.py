@@ -10,6 +10,8 @@ from nooa.skill_registry import SkillRegistry
 
 from .config import ResourceSettings
 
+_BUILTIN_SKILLS_DIR = Path(__file__).parent / "skills"
+
 
 def load_agents_context(repo: Path, settings: ResourceSettings) -> str:
     """Load configured AGENTS files, including nested files, under one size cap."""
@@ -47,13 +49,16 @@ def load_agents_context(repo: Path, settings: ResourceSettings) -> str:
 
 
 def install_resources(agent: Any, repo: Path, settings: ResourceSettings) -> SkillRegistry:
-    """Install AGENTS context plus project and user SKILL.md directories."""
+    """Install AGENTS context plus built-in, project, and user SKILL.md directories."""
     instructions = load_agents_context(repo, settings)
     if instructions:
         agent.context_manager["project_instructions"] = Context(instructions, prefix=True)
 
     registry = SkillRegistry(agent)
-    directories: list[Path] = [Path("~/.config/nooa-coding/skills").expanduser()]
+    directories: list[Path] = [
+        _BUILTIN_SKILLS_DIR,
+        Path("~/.config/nooa-coding/skills").expanduser(),
+    ]
     for value in settings.skills_dirs:
         path = Path(value).expanduser()
         directories.append(path if path.is_absolute() else repo / path)

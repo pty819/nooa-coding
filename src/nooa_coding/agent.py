@@ -21,8 +21,10 @@ from pydantic import BaseModel, Field
 
 from .config import CodingSettings
 from .mcp import MCPRuntime
+from .plugin import PluginRegistry
 from .policy import ApprovalManager, PolicyShellTools
 from .resources import install_resources, load_agents_context
+from .tools import CodeSearch, LSPTools
 
 with hidden:
     import ast
@@ -156,6 +158,8 @@ class CodingAgent(MemoryToolsMixin, InteractiveAgent):
     repo: Annotated[RepoTools, nosnapshot]
     todo: TodoManager
     skills: Annotated[SkillRegistry, nosnapshot]
+    search: Annotated[CodeSearch, nosnapshot]
+    lsp: Annotated[LSPTools, nosnapshot]
     task: str = ""
     last_result: CodingTaskResult | None = None
     _repo_root: Annotated[Path, hidden, nosnapshot]
@@ -163,6 +167,7 @@ class CodingAgent(MemoryToolsMixin, InteractiveAgent):
     _event_sink: Annotated[Any, hidden, nosnapshot]
     _memory: Annotated[MemoryManager, hidden, nosnapshot]
     _mcp: Annotated[MCPRuntime, hidden, nosnapshot]
+    _plugins: Annotated[PluginRegistry, hidden, nosnapshot]
 
     def __init__(
         self,
@@ -183,6 +188,8 @@ class CodingAgent(MemoryToolsMixin, InteractiveAgent):
         self.repo = RepoTools(root=self._repo_root, session=self.shell._session)
         self.todo = TodoManager()
         self.skills = install_resources(self, self._repo_root, settings.resources)
+        self.search = CodeSearch(self._repo_root)
+        self.lsp = LSPTools(self._repo_root)
         self._mcp = MCPRuntime(
             self._repo_root,
             settings.mcp,
@@ -190,6 +197,10 @@ class CodingAgent(MemoryToolsMixin, InteractiveAgent):
             event_sink,
         )
         self._mcp.install(self)
+        self._plugins = PluginRegistry()
+        plugin_dir = Path.home() / ".config" / "nooa-coding" / "plugins"
+        self._plugins.discover_directory(plugin_dir)
+        self._plugins.install_all(self)
         self.context_manager["coding_tools"] = Context(
             doc(PolicyShellTools, RepoTools, TodoManager), prefix=True
         )
@@ -262,6 +273,7 @@ class CodingAgent(MemoryToolsMixin, InteractiveAgent):
         memory = getattr(self, "_memory", None)
         if isinstance(memory, MemoryManager):
             memory.uninstall()
+        self._plugins.notify_close()
         self._mcp.close()
         await self.shell.close()
 
@@ -463,6 +475,7 @@ class CodingAgent(MemoryToolsMixin, InteractiveAgent):
         if not task:
             raise ValueError("task must be non-empty")
         self.task = task
+        self._plugins.notify_turn_start(task)
         local_answer = self._local_answer(task)
         if local_answer is not None:
             result = CodingTaskResult(
@@ -573,6 +586,7 @@ class CodingAgent(MemoryToolsMixin, InteractiveAgent):
             model=self._current_model(),
         )
         self.last_result = result
+        self._plugins.notify_turn_end(result)
         return result
 
     @hidden

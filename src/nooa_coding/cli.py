@@ -6,6 +6,7 @@ import asyncio
 import json
 import re
 from contextlib import suppress
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
@@ -48,10 +49,16 @@ _SLASH_COMMANDS = [
     "/permissions",
     "/review",
     "/plan",
+    "/suggest",
     "/goal",
     "/search",
     "/export",
     "/workspace",
+    "/init",
+    "/pr",
+    "/orchestrate",
+    "/lessons",
+    "/report",
     "/exit",
 ]
 
@@ -420,6 +427,128 @@ async def _interactive(manager: AgentSessionManager, session: AgentSession) -> N
                 _handle_mcp_command(session, text)
             elif text == "/workspace":
                 console.print(str(session.workspace))
+            elif text == "/init" or text.startswith("/init "):
+                from .init_project import init_project
+
+                force = "--force" in text
+                try:
+                    content = init_project(session.workspace, force=force)
+                    console.print(Text("✓ Generated AGENTS.md", style="green"))
+                    console.print(Text(content[:500], style="dim"))
+                except FileExistsError:
+                    console.print(
+                        Text("AGENTS.md already exists. Use /init --force to overwrite.", style="yellow")
+                    )
+            elif text == "/pr" or text.startswith("/pr "):
+                from .pr import prepare_and_create_pr
+
+                draft = "--draft" in text
+                console.print(Text("⟳ Preparing pull request…", style="dim italic"))
+                pr_result = await prepare_and_create_pr(
+                    session.workspace, draft=draft, llm=session.llm
+                )
+                if pr_result.success:
+                    console.print(Text("✓ PR created", style="green"))
+                    if pr_result.pr_url:
+                        console.print(Text(f"  {pr_result.pr_url}", style="underline cyan"))
+                else:
+                    console.print(Text(f"✗ {pr_result.error}", style="red"))
+            elif text.startswith("/orchestrate"):
+                objective = text.partition(" ")[2].strip()
+                if not objective:
+                    console.print(
+                        Text("Usage: /orchestrate OBJECTIVE", style="yellow")
+                    )
+                else:
+                    console.print(
+                        Text(f"⟳ Decomposing: {objective[:80]}…", style="dim italic")
+                    )
+                    orch = session.orchestrator
+                    plan = await orch.decompose(objective)
+                    console.print(
+                        Text(
+                            f"  → {len(plan.subtasks)} sub-tasks ({plan.strategy})",
+                            style="cyan",
+                        )
+                    )
+                    for i, st in enumerate(plan.subtasks, 1):
+                        console.print(Text(f"    {i}. {st.description}", style="dim"))
+                    console.print(Text("  Executing…", style="dim italic"))
+
+                    def _on_progress(task):  # noqa: ANN001, ANN201
+                        icon = "✓" if task.status.value == "completed" else "✗"
+                        console.print(
+                            Text(f"    {icon} {task.description[:60]}", style="green" if task.status.value == "completed" else "red")
+                        )
+
+                    await orch.execute_plan(on_progress=_on_progress)
+                    status = orch.status()
+                    console.print(
+                        Text(
+                            f"  Done: {status['completed']}/{status['total']} completed, "
+                            f"{status['failed']} failed",
+                            style="green" if status["failed"] == 0 else "yellow",
+                        )
+                    )
+            elif text == "/lessons" or text.startswith("/lessons "):
+                store = session.lesson_store
+                subcmd = text.partition(" ")[2].strip()
+                if subcmd == "stats":
+                    stats = store.stats()
+                    console.print(
+                        Text(
+                            f"Lessons: {stats['total']} total, by category: {stats['by_category']}",
+                            style="cyan",
+                        )
+                    )
+                elif subcmd.startswith("delete "):
+                    lesson_id = subcmd[7:].strip()
+                    if store.delete(lesson_id):
+                        console.print(Text(f"Deleted lesson {lesson_id}", style="green"))
+                    else:
+                        console.print(Text(f"Lesson not found: {lesson_id}", style="yellow"))
+                else:
+                    lessons = store.recent(limit=10)
+                    if not lessons:
+                        console.print(Text("No lessons stored yet.", style="dim"))
+                    else:
+                        for lesson in lessons:
+                            console.print(
+                                Text(f"  [{lesson.category}] ", style="cyan")
+                                + Text(lesson.title, style="bold")
+                                + Text(f" ({lesson.lesson_id})", style="dim")
+                            )
+                            console.print(Text(f"    {lesson.content[:100]}", style="dim"))
+            elif text == "/report" or text.startswith("/report "):
+                from .report import ReportMetadata, SessionReport, write_report
+
+                fmt_arg = text.partition(" ")[2].strip()
+                formats = fmt_arg.split(",") if fmt_arg else ["json", "html"]
+                usage = session.token_usage
+                result = session.agent.last_result
+                report = SessionReport(
+                    metadata=ReportMetadata(
+                        session_id=session.session_id,
+                        generated_at=datetime.now(UTC).isoformat(),
+                    ),
+                    summary=result.summary if result else "No result yet",
+                    status=result.status if result else "idle",
+                    changed_files=result.changed_files if result else [],
+                    verifications=[
+                        v.model_dump() for v in (result.verifications if result else [])
+                    ],
+                    token_usage={
+                        "prompt_tokens": usage.prompt_tokens,
+                        "completion_tokens": usage.completion_tokens,
+                        "total_tokens": usage.total_tokens,
+                        "cost_usd": f"{usage.total_cost_usd:.4f}",
+                    },
+                    events_count=session._sequence,
+                )
+                output_dir = Path.cwd() / "nooa-reports"
+                written = write_report(report, output_dir, formats=formats)
+                for path in written:
+                    console.print(Text(f"✓ {path}", style="green"))
             elif text == "/cost":
                 renderer.token_usage(session.token_usage)
             elif text == "/status":
@@ -482,8 +611,15 @@ async def _interactive(manager: AgentSessionManager, session: AgentSession) -> N
                 )
             elif text == "/review":
                 console.print(Text("⟳ Reviewing current diff…", style="dim italic"))
-                review_text = await session.review()
-                console.print(Markdown(review_text))
+                try:
+                    async for token in session.stream_direct(
+                        "Review the following diff:\n" + session.diff().patch[:30000]
+                    ):
+                        console.print(token, end="", highlight=False)
+                    console.print()
+                except Exception:
+                    review_text = await session.review()
+                    console.print(Markdown(review_text))
             elif text.startswith("/plan"):
                 plan_task = text.partition(" ")[2].strip()
                 if not plan_task:
@@ -492,11 +628,32 @@ async def _interactive(manager: AgentSessionManager, session: AgentSession) -> N
                     )
                 else:
                     console.print(Text("⟳ Generating plan…", style="dim italic"))
-                    plan_text = await session.plan(plan_task)
-                    console.print(Markdown(plan_text))
+                    try:
+                        async for token in session.stream_direct(
+                            "Create a detailed implementation plan for: " + plan_task
+                        ):
+                            console.print(token, end="", highlight=False)
+                        console.print()
+                    except Exception:
+                        plan_text = await session.plan(plan_task)
+                        console.print(Markdown(plan_text))
                     console.print(
                         Text(
                             "\nSend the task text to execute, or refine with /plan again.",
+                            style="dim",
+                        )
+                    )
+            elif text.startswith("/suggest"):
+                suggest_task = text.partition(" ")[2].strip()
+                if not suggest_task:
+                    console.print(Text("Usage: /suggest <what to change>", style="yellow"))
+                else:
+                    console.print(Text("⟳ Generating suggestion…", style="dim italic"))
+                    suggestion = await session.suggest(suggest_task)
+                    console.print(Syntax(suggestion, "diff", word_wrap=True))
+                    console.print(
+                        Text(
+                            "\nApply manually or send the task text to execute.",
                             style="dim",
                         )
                     )

@@ -137,11 +137,15 @@ class TerminalRenderer:
             ("/model [NAME]", "Show or switch the active model"),
             ("/permissions [MODE]", "Show or switch permission mode (allow/ask/default)"),
             ("/plan TASK", "Generate an implementation plan without executing"),
+            ("/suggest TASK", "Generate a diff suggestion without applying"),
             ("/goal OBJECTIVE", "Set a goal; agent auto-continues until achieved"),
             ("/goal clear", "Clear the active goal"),
             ("/review", "LLM-powered code review of the current diff"),
             ("/search QUERY", "Web search and return results"),
             ("/export", "Export session events to JSONL"),
+            ("/init [--force]", "Analyze repo and generate AGENTS.md"),
+            ("/pr [--draft]", "Push branch and create a pull request"),
+            ("/orchestrate OBJ", "Decompose and execute a complex task"),
             ("/workspace", "Print the isolated worktree path"),
             ("/exit", "Save and exit"),
         )
@@ -247,9 +251,20 @@ class TerminalRenderer:
             return
         if event.name == "file_changed":
             path = clean_terminal_text(event.data.get("path", ""))
+            operation = event.data.get("operation", "edit")
+            icon = "✎" if operation == "replace" else "＋"
             self.console.print(
-                Text("  ✎ ", style="green") + Text(path, style="underline green")
+                Text(f"  {icon} ", style="green") + Text(path, style="underline green")
             )
+            diff = event.data.get("diff", "")
+            if diff:
+                for line in diff.splitlines()[:8]:
+                    if line.startswith("+ "):
+                        self.console.print(Text(f"    {line}", style="green"))
+                    elif line.startswith("- "):
+                        self.console.print(Text(f"    {line}", style="red"))
+                    else:
+                        self.console.print(Text(f"    {line}", style="dim"))
             return
         if event.name == "mcp_server_connected":
             server = clean_terminal_text(event.data.get("server", ""))
