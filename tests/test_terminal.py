@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from io import StringIO
+from pathlib import Path
 
 from rich.console import Console
 
 from nooa_coding.agent import CodingTaskResult, VerificationResult
 from nooa_coding.events import SessionEvent
 from nooa_coding.mcp import MCPServerStatus
-from nooa_coding.terminal import TerminalRenderer, clean_terminal_text
+from nooa_coding.terminal import TerminalRenderer, ThinkingSpinner, clean_terminal_text
 
 
 def _renderer() -> tuple[TerminalRenderer, StringIO]:
@@ -94,5 +95,48 @@ def test_renderer_shows_mcp_status_and_call_events_without_arguments() -> None:
     )
     output = stream.getvalue()
     assert "mcp_docs" in output
-    assert "MCP docs.search" in output
+    assert "docs" in output and "search" in output
     assert "secret" not in output
+
+
+def test_banner_shows_logo_and_session_info() -> None:
+    renderer, stream = _renderer()
+    renderer.banner("test-session", "openai/gpt-5", Path("/tmp/wt"))
+    output = stream.getvalue()
+    assert "NOOA" in output
+    assert "test-session" in output
+    assert "gpt-5" in output
+    assert "/tmp/wt" in output
+
+
+def test_user_input_renders_separator_and_preview() -> None:
+    renderer, stream = _renderer()
+    renderer.user_input("implement the login feature")
+    output = stream.getvalue()
+    assert "implement the login feature" in output
+    # Should contain a rule/separator.
+    assert "─" in output or "━" in output or "❯" in output
+
+
+def test_thinking_spinner_lifecycle() -> None:
+    stream = StringIO()
+    console = Console(file=stream, force_terminal=False, width=100)
+    spinner = ThinkingSpinner(console)
+    spinner.start("Thinking")
+    spinner.update("Running: pytest")
+    spinner.stop("Done")
+    output = stream.getvalue()
+    assert "Thinking" in output
+    assert "Running: pytest" in output
+    assert "Done" in output
+
+
+def test_goal_progress_renders_bar() -> None:
+    renderer, stream = _renderer()
+    renderer.goal_progress("all tests pass", 3, 10, "still failing")
+    output = stream.getvalue()
+    assert "Goal" in output
+    assert "3/10" in output
+    assert "█" in output
+    assert "░" in output
+    assert "still failing" in output

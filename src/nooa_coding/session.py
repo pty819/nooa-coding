@@ -200,6 +200,7 @@ class AgentSession:
         )
         messages = [{"role": "user", "content": review_prompt}]
         response = await self.llm.acall(messages)
+        self._track_direct_llm_call(response)
         self._emit("session", "review_completed", {"files": diff.stat})
         return response.content or "Review produced no output."
 
@@ -217,6 +218,7 @@ class AgentSession:
         )
         messages = [{"role": "user", "content": plan_prompt}]
         response = await self.llm.acall(messages)
+        self._track_direct_llm_call(response)
         self._emit("session", "plan_generated", {"task": task[:200]})
         return response.content or "Plan produced no output."
 
@@ -227,25 +229,27 @@ class AgentSession:
 
         encoded = urllib.parse.quote_plus(query)
         url = f"https://html.duckduckgo.com/html/?q={encoded}"
-        try:
+
+        def _fetch() -> str:
             req = urllib.request.Request(url, headers={"User-Agent": "nooa-coding/0.1"})
             with urllib.request.urlopen(req, timeout=15) as resp:  # noqa: S310
-                html = resp.read().decode("utf-8", errors="replace")
+                return resp.read().decode("utf-8", errors="replace")
+
+        try:
+            html = await asyncio.to_thread(_fetch)
         except Exception as exc:
             self._emit("error", "web_search_failed", {"query": query, "error": str(exc)})
             return f"Web search failed: {exc}"
 
         # Extract result snippets from DuckDuckGo HTML.
-        import re as _re
-
         results: list[str] = []
-        for match in _re.finditer(
+        for match in re.finditer(
             r'class="result__a"[^>]*>(.*?)</a>.*?class="result__snippet"[^>]*>(.*?)</span>',
             html,
-            _re.DOTALL,
+            re.DOTALL,
         ):
-            title = _re.sub(r"<[^>]+>", "", match.group(1)).strip()
-            snippet = _re.sub(r"<[^>]+>", "", match.group(2)).strip()
+            title = re.sub(r"<[^>]+>", "", match.group(1)).strip()
+            snippet = re.sub(r"<[^>]+>", "", match.group(2)).strip()
             if title:
                 results.append(f"- {title}: {snippet}")
             if len(results) >= 8:
@@ -308,6 +312,7 @@ class AgentSession:
         )
         messages = [{"role": "user", "content": eval_prompt}]
         response = await self.llm.acall(messages)
+        self._track_direct_llm_call(response)
         evaluation = response.content or "NOT_ACHIEVED: evaluator produced no output"
         self._goal.last_evaluation = evaluation
 
@@ -381,6 +386,29 @@ class AgentSession:
             "model_failover",
             "model_failover",
             {"from": source, "to": target, "error": error},
+        )
+
+    def _track_direct_llm_call(self, response: Any) -> None:
+        """Accumulate token usage from a direct LLM call that bypasses agent events."""
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return
+        self._token_usage.add(
+            prompt_tokens=getattr(usage, "prompt_tokens", 0),
+            completion_tokens=getattr(usage, "completion_tokens", 0),
+            cached_tokens=getattr(usage, "cached_tokens", 0),
+            reasoning_tokens=getattr(usage, "reasoning_tokens", 0),
+            cost_usd=getattr(usage, "cost_usd", 0.0),
+        )
+        self._emit(
+            "usage",
+            "token_usage",
+            {
+                "prompt_tokens": getattr(usage, "prompt_tokens", 0),
+                "completion_tokens": getattr(usage, "completion_tokens", 0),
+                "source": "direct",
+                "cumulative_tokens": self._token_usage.total_tokens,
+            },
         )
 
     @property
@@ -514,6 +542,13 @@ class AgentSession:
 
     def deny(self, request_id: str) -> None:
         self.approvals.decide(request_id, allow=False)
+
+    def clear_history(self) -> None:
+        """Clear the agent conversation history (in-memory event store)."""
+        backend = self.agent.event_manager._backend  # noqa: SLF001
+        backend._events.clear()  # noqa: SLF001
+        backend._active_tags.clear()  # noqa: SLF001
+        self._emit("session", "history_cleared", {})
 
     def mcp_status(self) -> list[MCPServerStatus]:
         return self.agent._mcp.statuses()
@@ -848,6 +883,7 @@ class AgentSessionManager:
 __all__ = [
     "AgentSession",
     "AgentSessionManager",
+    "GoalState",
     "SessionMetadata",
     "SessionStatus",
     "SessionSummary",

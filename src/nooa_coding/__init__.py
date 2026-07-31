@@ -2,12 +2,13 @@
 
 from .config import CodingSettings, MCPPermissionSettings, MCPSettings, load_settings
 from .mcp import MCPServerStatus
-from .session import AgentSession, AgentSessionManager
+from .session import AgentSession, AgentSessionManager, GoalState
 
 __all__ = [
     "AgentSession",
     "AgentSessionManager",
     "CodingSettings",
+    "GoalState",
     "MCPPermissionSettings",
     "MCPServerStatus",
     "MCPSettings",

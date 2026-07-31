@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from contextlib import suppress
 from pathlib import Path
 from typing import Protocol
@@ -14,9 +15,11 @@ from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.patch_stdout import patch_stdout
 from rich.console import Console
+from rich.markdown import Markdown
 from rich.syntax import Syntax
 from rich.text import Text
 
+from .agent import CodingTaskResult
 from .config import CodingSettings, ModelEndpoint, load_settings
 from .events import SessionEvent
 from .session import AgentSession, AgentSessionManager
@@ -139,9 +142,8 @@ class AsyncPrompt(Protocol):
 
 def _expand_at_mentions(text: str, workspace: Path) -> str:
     """Expand @file references by inlining file content."""
-    import re as _re
 
-    def _replace(match: _re.Match) -> str:  # noqa: ANN001
+    def _replace(match: re.Match) -> str:  # noqa: ANN001
         rel_path = match.group(1)
         target = workspace / rel_path
         if target.is_file():
@@ -159,7 +161,7 @@ def _expand_at_mentions(text: str, workspace: Path) -> str:
             return f"\n--- @{rel_path}/ (directory) ---\n{listing}\n"
         return match.group(0)
 
-    return _re.sub(r"@([\w./\-]+)", _replace, text)
+    return re.sub(r"@([\w./\-]+)", _replace, text)
 
 
 class ApprovalController(Protocol):
@@ -203,7 +205,7 @@ async def _run_single_turn(
     control_task: asyncio.Task[str] | None = None
     if allow_controls:
         control_task = asyncio.create_task(
-            prompt.prompt_async("[running: /cancel, /approve ID, /deny ID] > ")
+            prompt.prompt_async("\001\033[2m\002  ⋮ /cancel · /approve · /deny\001\033[0m\002 > ")
         )
     pending_followups: list[str] = []
     try:
@@ -265,7 +267,7 @@ async def _run_single_turn(
                     console.print(Text("Follow-up queued for the next turn.", style="dim"))
                 if not turn.done():
                     control_task = asyncio.create_task(
-                        prompt.prompt_async("[running: /cancel, /approve ID, /deny ID] > ")
+                        prompt.prompt_async("\001\033[2m\002  ⋮ /cancel · /approve · /deny\001\033[0m\002 > ")
                     )
         try:
             result = await turn
@@ -347,10 +349,27 @@ async def _interactive(manager: AgentSessionManager, session: AgentSession) -> N
         enable_history_search=True,
     )
     renderer.banner(session.session_id, session.current_model, session.workspace)
+
+    def _prompt_msg() -> str:
+        model_short = session.current_model.split("/")[-1][:20]
+        return f"\001\033[1;34m\002{model_short}\001\033[0m\002 \001\033[2m\002❯\001\033[0m\002 "
+
+    def _bottom_toolbar() -> str:
+        goal_hint = ""
+        if session.goal and session.goal.status == "active":
+            goal_hint = f" | \001\033[36m\002◎ goal {session.goal.turns_used}/{session.goal.turn_budget}\001\033[0m\002"
+        return (
+            " \001\033[2m\002Ctrl+J\001\033[0m\002 newline"
+            " · \001\033[2m\002Ctrl+G\001\033[0m\002 editor"
+            " · \001\033[2m\002Tab\001\033[0m\002 complete"
+            " · \001\033[2m\002/help\001\033[0m\002 commands"
+            f"{goal_hint}"
+        )
+
     with patch_stdout(raw=True):
         while True:
             try:
-                text = (await terminal.prompt_async("nooa-code> ")).strip()
+                text = (await terminal.prompt_async(_prompt_msg(), bottom_toolbar=_bottom_toolbar)).strip()
             except (EOFError, KeyboardInterrupt):
                 break
             if not text:
@@ -406,8 +425,7 @@ async def _interactive(manager: AgentSessionManager, session: AgentSession) -> N
             elif text == "/status":
                 renderer.status(session)
             elif text == "/clear":
-                session.agent.event_manager._backend._events.clear()  # noqa: SLF001
-                session.agent.event_manager._backend._active_tags.clear()  # noqa: SLF001
+                session.clear_history()
                 console.print(Text("Conversation history cleared.", style="dim"))
             elif text.startswith("/model"):
                 requested_model = text.partition(" ")[2].strip()
@@ -465,9 +483,7 @@ async def _interactive(manager: AgentSessionManager, session: AgentSession) -> N
             elif text == "/review":
                 console.print(Text("⟳ Reviewing current diff…", style="dim italic"))
                 review_text = await session.review()
-                from rich.markdown import Markdown as Md
-
-                console.print(Md(review_text))
+                console.print(Markdown(review_text))
             elif text.startswith("/plan"):
                 plan_task = text.partition(" ")[2].strip()
                 if not plan_task:
@@ -477,9 +493,7 @@ async def _interactive(manager: AgentSessionManager, session: AgentSession) -> N
                 else:
                     console.print(Text("⟳ Generating plan…", style="dim italic"))
                     plan_text = await session.plan(plan_task)
-                    from rich.markdown import Markdown as Md
-
-                    console.print(Md(plan_text))
+                    console.print(Markdown(plan_text))
                     console.print(
                         Text(
                             "\nSend the task text to execute, or refine with /plan again.",
@@ -532,6 +546,7 @@ async def _interactive(manager: AgentSessionManager, session: AgentSession) -> N
                 console.print(Text("Unknown command. Use /help.", style="red"))
             else:
                 expanded = _expand_at_mentions(text, session.workspace)
+                renderer.user_input(text)
                 await _run_turn(session, expanded, terminal, allow_controls=True)
                 # Goal-driven reconcile loop: auto-continue until achieved.
                 while session.goal is not None and session.goal.status == "active":
@@ -542,34 +557,41 @@ async def _interactive(manager: AgentSessionManager, session: AgentSession) -> N
                     if not turn_results:
                         break
                     last_data = turn_results[-1].data.get("result", {})
-                    from .agent import CodingTaskResult as _CTR
-
-                    last_result = _CTR.model_validate(last_data)
+                    last_result = CodingTaskResult.model_validate(last_data)
                     console.print(Text(
-                        f"⟳ Evaluating goal ({session.goal.turns_used + 1}/{session.goal.turn_budget})…",
+                        f"  ◐ Evaluating goal ({session.goal.turns_used + 1}/{session.goal.turn_budget})…",
                         style="dim italic",
                     ))
                     achieved, evaluation = await session.evaluate_goal(last_result)
                     if achieved:
+                        renderer.goal_progress(
+                            session.goal.objective,
+                            session.goal.turns_used,
+                            session.goal.turn_budget,
+                            "✓ Achieved!",
+                        )
                         console.print(Text(
-                            f"✓ Goal achieved: {evaluation}",
+                            f"  ✓ Goal achieved: {evaluation}",
                             style="bold green",
                         ))
                         break
                     if session.goal.status != "active":
                         console.print(Text(
-                            f"Goal loop ended: {evaluation}",
+                            f"  Goal loop ended: {evaluation}",
                             style="yellow",
                         ))
                         break
+                    # Show progress bar.
+                    renderer.goal_progress(
+                        session.goal.objective,
+                        session.goal.turns_used,
+                        session.goal.turn_budget,
+                        evaluation,
+                    )
                     # Extract next action from evaluation.
                     next_action = evaluation
                     if "NOT_ACHIEVED:" in evaluation:
                         next_action = evaluation.split("NOT_ACHIEVED:", 1)[1].strip()
-                    console.print(Text(
-                        f"→ Not yet achieved. Continuing: {next_action[:150]}",
-                        style="dim",
-                    ))
                     continuation = (
                         f"Continue working toward the goal: {session.goal.objective}\n\n"
                         f"Evaluator feedback: {next_action}"
@@ -743,19 +765,26 @@ def main(
         elif stdin_context and not effective_task:
             effective_task = stdin_context
 
-        # Attach image descriptions for multimodal context.
+        # Attach image context for multimodal input.
         if images and effective_task:
-            import base64
-
             image_parts: list[str] = []
+            max_image_bytes = 4 * 1024 * 1024  # 4 MB per image
             for img_path in images:
                 try:
-                    data = base64.b64encode(img_path.read_bytes()).decode()
-                    suffix = img_path.suffix.lstrip(".").lower() or "png"
-                    mime = {"jpg": "jpeg", "svg": "svg+xml"}.get(suffix, suffix)
-                    image_parts.append(
-                        f"[Image: {img_path.name}](data:image/{mime};base64,{data[:100]}...)"
-                    )
+                    raw = img_path.read_bytes()
+                    if len(raw) > max_image_bytes:
+                        image_parts.append(
+                            f"[Image: {img_path.name} ({len(raw)} bytes, too large to inline)]"
+                        )
+                    else:
+                        import base64
+
+                        data = base64.b64encode(raw).decode()
+                        suffix = img_path.suffix.lstrip(".").lower() or "png"
+                        mime = {"jpg": "jpeg", "svg": "svg+xml"}.get(suffix, suffix)
+                        image_parts.append(
+                            f"![{img_path.name}](data:image/{mime};base64,{data})"
+                        )
                 except OSError:
                     image_parts.append(f"[Image: {img_path.name} (unreadable)]")
             effective_task = f"{effective_task}\n\n--- Attached images ---\n" + "\n".join(image_parts)
