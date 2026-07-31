@@ -34,8 +34,9 @@ class ApprovalRequest(BaseModel):
 class ApprovalManager:
     """Own pending approval futures so a UI can answer while a tool is blocked."""
 
-    def __init__(self, event_sink: EventSink) -> None:
+    def __init__(self, event_sink: EventSink, *, hook_runner: HookRunner | None = None) -> None:
         self._event_sink = event_sink
+        self._hook_runner = hook_runner
         self._pending: dict[str, tuple[ApprovalRequest, asyncio.Future[bool]]] = {}
 
     def pending(self) -> list[ApprovalRequest]:
@@ -48,6 +49,9 @@ class ApprovalManager:
             resource=resource,
             reason=reason,
         )
+        # PermissionRequest hook.
+        if self._hook_runner:
+            await self._hook_runner.trigger_permission_request(kind, resource, reason)
         future = asyncio.get_running_loop().create_future()
         self._pending[request.request_id] = (request, future)
         self._event_sink("approval_requested", request.model_dump())

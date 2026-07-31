@@ -1,6 +1,9 @@
-"""Claude Code compatible hooks system with declarative JSON configuration.
+"""Claude Code / Codex compatible hooks system with declarative JSON configuration.
 
-Supports lifecycle events: PreToolUse, PostToolUse, Stop, Notification, SessionStart.
+Supports 10 lifecycle events:
+PreToolUse, PostToolUse, Stop, Notification, SessionStart,
+PermissionRequest, PreCompact, PostCompact, SubagentStart, SubagentStop.
+
 Hooks can execute shell commands with environment variable injection and matcher filtering.
 
 Configuration format (settings.json "hooks" field or .nooa-coding/hooks.json)::
@@ -54,6 +57,11 @@ class HookEvent(StrEnum):
     STOP = "Stop"
     NOTIFICATION = "Notification"
     SESSION_START = "SessionStart"
+    PERMISSION_REQUEST = "PermissionRequest"
+    PRE_COMPACT = "PreCompact"
+    POST_COMPACT = "PostCompact"
+    SUBAGENT_START = "SubagentStart"
+    SUBAGENT_STOP = "SubagentStop"
 
 
 # ─── Configuration Models ────────────────────────────────────────────────────
@@ -292,6 +300,95 @@ class HookRunner:
                     event=HookEvent.SESSION_START,
                 )
                 results.append(result)
+        return results
+
+    # ─── PermissionRequest ─────────────────────────────────────────────
+
+    async def trigger_permission_request(
+        self,
+        kind: str,
+        resource: str,
+        reason: str = "",
+    ) -> list[HookResult]:
+        """Run PermissionRequest hooks when an approval is requested."""
+        rules = self._matching_rules(HookEvent.PERMISSION_REQUEST, kind)
+        results: list[HookResult] = []
+        for rule in rules:
+            for action in rule.hooks:
+                result = await self._execute_action(
+                    action,
+                    event=HookEvent.PERMISSION_REQUEST,
+                    tool_name=kind,
+                    tool_input=f"{resource}: {reason}",
+                    file_path=resource if kind in ("file_write", "file_read") else "",
+                )
+                results.append(result)
+        return results
+
+    # ─── PreCompact / PostCompact ──────────────────────────────────────
+
+    async def trigger_pre_compact(self, *, context_summary: str = "") -> list[HookResult]:
+        """Run PreCompact hooks before context compaction."""
+        rules = self._matching_rules(HookEvent.PRE_COMPACT, "*")
+        results: list[HookResult] = []
+        for rule in rules:
+            for action in rule.hooks:
+                result = await self._execute_action(
+                    action,
+                    event=HookEvent.PRE_COMPACT,
+                    tool_input=context_summary,
+                )
+                results.append(result)
+        return results
+
+    async def trigger_post_compact(self, *, summary: str = "") -> list[HookResult]:
+        """Run PostCompact hooks after context compaction."""
+        rules = self._matching_rules(HookEvent.POST_COMPACT, "*")
+        results: list[HookResult] = []
+        for rule in rules:
+            for action in rule.hooks:
+                result = await self._execute_action(
+                    action,
+                    event=HookEvent.POST_COMPACT,
+                    tool_output=summary,
+                )
+                results.append(result)
+        return results
+
+    # ─── SubagentStart / SubagentStop ──────────────────────────────────
+
+    async def trigger_subagent_start(
+        self, worker_id: str, task: str = ""
+    ) -> list[HookResult]:
+        """Run SubagentStart hooks when a worker agent begins."""
+        rules = self._matching_rules(HookEvent.SUBAGENT_START, worker_id)
+        results: list[HookResult] = []
+        for rule in rules:
+            for action in rule.hooks:
+                result = await self._execute_action(
+                    action,
+                    event=HookEvent.SUBAGENT_START,
+                    tool_name=worker_id,
+                    tool_input=task,
+                )
+                results.append(result)
+        return results
+
+    async def trigger_subagent_stop(
+        self, worker_id: str, *, result: str = "", status: str = ""
+    ) -> list[HookResult]:
+        """Run SubagentStop hooks when a worker agent finishes."""
+        rules = self._matching_rules(HookEvent.SUBAGENT_STOP, worker_id)
+        results: list[HookResult] = []
+        for rule in rules:
+            for action in rule.hooks:
+                hook_result = await self._execute_action(
+                    action,
+                    event=HookEvent.SUBAGENT_STOP,
+                    tool_name=worker_id,
+                    tool_output=f"{status}: {result}",
+                )
+                results.append(hook_result)
         return results
 
     # ─── Internal ────────────────────────────────────────────────────────

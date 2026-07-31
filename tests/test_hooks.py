@@ -327,3 +327,124 @@ class TestEventSink:
         await runner.trigger_pre_tool_use("Bash", tool_input="rm -rf /")
         event_names = [e[0] for e in events]
         assert "hook_blocked" in event_names
+
+
+# ─── PermissionRequest ──────────────────────────────────────────────────────
+
+
+class TestPermissionRequest:
+    async def test_triggers_on_matching_kind(self, tmp_path):
+        output = tmp_path / "perm.txt"
+        config = HooksConfig(hooks={
+            "PermissionRequest": [
+                {
+                    "matcher": "shell",
+                    "hooks": [{"type": "command", "command": f'echo "$TOOL_NAME:$TOOL_INPUT" > {output}'}],
+                }
+            ]
+        })
+        runner = HookRunner(config, workspace=str(tmp_path))
+        results = await runner.trigger_permission_request("shell", "rm -rf /", "dangerous")
+        assert len(results) == 1
+        assert results[0].returncode == 0
+        content = output.read_text()
+        assert "shell:" in content
+
+    async def test_non_matching_kind_skips(self, tmp_path):
+        config = HooksConfig(hooks={
+            "PermissionRequest": [
+                {"matcher": "file_write", "hooks": [{"type": "command", "command": "exit 1"}]}
+            ]
+        })
+        runner = HookRunner(config, workspace=str(tmp_path))
+        results = await runner.trigger_permission_request("shell", "ls", "")
+        assert results == []
+
+
+# ─── PreCompact / PostCompact ───────────────────────────────────────────────
+
+
+class TestCompactHooks:
+    async def test_pre_compact(self, tmp_path):
+        output = tmp_path / "pre_compact.txt"
+        config = HooksConfig(hooks={
+            "PreCompact": [
+                {
+                    "matcher": "*",
+                    "hooks": [{"type": "command", "command": f'echo "$TOOL_INPUT" > {output}'}],
+                }
+            ]
+        })
+        runner = HookRunner(config, workspace=str(tmp_path))
+        results = await runner.trigger_pre_compact(context_summary="saving context")
+        assert len(results) == 1
+        assert results[0].returncode == 0
+        assert "saving context" in output.read_text()
+
+    async def test_post_compact(self, tmp_path):
+        output = tmp_path / "post_compact.txt"
+        config = HooksConfig(hooks={
+            "PostCompact": [
+                {
+                    "matcher": "*",
+                    "hooks": [{"type": "command", "command": f'echo "$TOOL_OUTPUT" > {output}'}],
+                }
+            ]
+        })
+        runner = HookRunner(config, workspace=str(tmp_path))
+        results = await runner.trigger_post_compact(summary="compacted summary")
+        assert len(results) == 1
+        assert "compacted summary" in output.read_text()
+
+
+# ─── SubagentStart / SubagentStop ───────────────────────────────────────────
+
+
+class TestSubagentHooks:
+    async def test_subagent_start(self, tmp_path):
+        output = tmp_path / "start.txt"
+        config = HooksConfig(hooks={
+            "SubagentStart": [
+                {
+                    "matcher": "*",
+                    "hooks": [{"type": "command", "command": f'echo "$TOOL_NAME:$TOOL_INPUT" > {output}'}],
+                }
+            ]
+        })
+        runner = HookRunner(config, workspace=str(tmp_path))
+        results = await runner.trigger_subagent_start("worker-0", task="refactor auth")
+        assert len(results) == 1
+        assert results[0].returncode == 0
+        content = output.read_text()
+        assert "worker-0:refactor auth" in content
+
+    async def test_subagent_stop(self, tmp_path):
+        output = tmp_path / "stop.txt"
+        config = HooksConfig(hooks={
+            "SubagentStop": [
+                {
+                    "matcher": "*",
+                    "hooks": [{"type": "command", "command": f'echo "$TOOL_OUTPUT" > {output}'}],
+                }
+            ]
+        })
+        runner = HookRunner(config, workspace=str(tmp_path))
+        results = await runner.trigger_subagent_stop(
+            "worker-1", result="done", status="completed"
+        )
+        assert len(results) == 1
+        assert "completed: done" in output.read_text()
+
+    async def test_subagent_matcher_filters(self, tmp_path):
+        config = HooksConfig(hooks={
+            "SubagentStart": [
+                {"matcher": "worker-0", "hooks": [{"type": "command", "command": "exit 0"}]}
+            ]
+        })
+        runner = HookRunner(config, workspace=str(tmp_path))
+        # Matching worker.
+        results = await runner.trigger_subagent_start("worker-0", task="test")
+        assert len(results) == 1
+        # Non-matching worker.
+        results = await runner.trigger_subagent_start("worker-5", task="test")
+        assert results == []

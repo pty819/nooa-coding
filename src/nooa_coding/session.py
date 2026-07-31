@@ -108,8 +108,6 @@ class AgentSession:
         self._lesson_store: LessonStore | None = None
         self._lesson_extractor: LessonExtractor | None = None
 
-        self.approvals = ApprovalManager(self._policy_event)
-        policy = PermissionPolicy(settings.permissions, self.approvals)
         hooks_config = load_hooks_config(
             metadata.workspace.path,
             settings_hooks=getattr(settings, "hooks", None),
@@ -120,6 +118,8 @@ class AgentSession:
             session_id=metadata.session_id,
             event_sink=self._tool_event,
         )
+        self.approvals = ApprovalManager(self._policy_event, hook_runner=self._hook_runner)
+        policy = PermissionPolicy(settings.permissions, self.approvals)
         shell = PolicyShellTools(
             metadata.workspace.path,
             policy,
@@ -336,7 +336,7 @@ class AgentSession:
     def orchestrator(self) -> Orchestrator:
         """Lazy-initialized multi-agent orchestrator for this session."""
         if self._orchestrator is None:
-            self._orchestrator = Orchestrator(self)
+            self._orchestrator = Orchestrator(self, hook_runner=self._hook_runner)
         return self._orchestrator
 
     @property
@@ -700,9 +700,17 @@ class AgentSession:
     async def compact(self, *, preserve_recent: int | None = None) -> str | None:
         if self._active_task is not None:
             raise RuntimeError("cannot compact while a turn is running")
+        # PreCompact hook — allows external tools to save context before compaction.
+        with contextlib.suppress(Exception):
+            await self._hook_runner.trigger_pre_compact(
+                context_summary=f"preserve_recent={preserve_recent}"
+            )
         tag = await self.agent.compact_history(preserve_recent=preserve_recent)
         self._save_snapshot()
         self._emit("session", "history_compacted", {"summary_tag": tag})
+        # PostCompact hook — verify summary integrity.
+        with contextlib.suppress(Exception):
+            await self._hook_runner.trigger_post_compact(summary=tag or "")
         return tag
 
     def diff(self) -> DiffResult:

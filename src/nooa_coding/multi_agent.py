@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import uuid
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, Field
+
+if TYPE_CHECKING:
+    from .hooks import HookRunner
 
 
 class TaskStatus(StrEnum):
@@ -72,9 +76,12 @@ class OrchestrationPlan(BaseModel):
 class WorkerAgent:
     """A lightweight worker that executes a single sub-task."""
 
-    def __init__(self, worker_id: str, session: Any) -> None:
+    def __init__(
+        self, worker_id: str, session: Any, *, hook_runner: HookRunner | None = None
+    ) -> None:
         self.worker_id = worker_id
         self._session = session
+        self._hook_runner = hook_runner
         self._inbox: asyncio.Queue[WorkerMessage] = asyncio.Queue()
         self._running = False
 
@@ -84,6 +91,13 @@ class WorkerAgent:
         task.worker_id = self.worker_id
         task.started_at = datetime.now(UTC).isoformat()
         self._running = True
+
+        # SubagentStart hook.
+        if self._hook_runner:
+            with contextlib.suppress(Exception):
+                await self._hook_runner.trigger_subagent_start(
+                    self.worker_id, task=task.description
+                )
 
         try:
             result = await self._session.prompt(task.description)
@@ -99,6 +113,14 @@ class WorkerAgent:
         finally:
             self._running = False
             task.completed_at = datetime.now(UTC).isoformat()
+            # SubagentStop hook.
+            if self._hook_runner:
+                with contextlib.suppress(Exception):
+                    await self._hook_runner.trigger_subagent_stop(
+                        self.worker_id,
+                        result=task.result or task.error,
+                        status=task.status.value,
+                    )
 
         return task
 
@@ -117,9 +139,10 @@ class Orchestrator:
         results = await orchestrator.execute_plan(plan)
     """
 
-    def __init__(self, session: Any, *, max_workers: int = 3) -> None:
+    def __init__(self, session: Any, *, max_workers: int = 3, hook_runner: HookRunner | None = None) -> None:
         self._session = session
         self._max_workers = max_workers
+        self._hook_runner = hook_runner
         self._workers: dict[str, WorkerAgent] = {}
         self._message_log: list[WorkerMessage] = []
         self._plan: OrchestrationPlan | None = None
@@ -283,7 +306,9 @@ class Orchestrator:
 
     def _get_or_create_worker(self, worker_id: str) -> WorkerAgent:
         if worker_id not in self._workers:
-            self._workers[worker_id] = WorkerAgent(worker_id, self._session)
+            self._workers[worker_id] = WorkerAgent(
+                worker_id, self._session, hook_runner=self._hook_runner
+            )
         return self._workers[worker_id]
 
     def status(self) -> dict[str, Any]:
