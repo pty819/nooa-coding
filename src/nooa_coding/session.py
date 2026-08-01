@@ -23,7 +23,7 @@ from .agent import CodingAgent, CodingTaskResult
 from .config import CodingSettings, load_settings
 from .events import SessionEvent, SessionEventKind, TokenUsage
 from .hooks import HookRunner, load_hooks_config
-from .learning import LessonExtractor, LessonStore, get_default_store
+from .learning import LessonExtractor, LessonStore
 from .llm import build_llm
 from .mcp import MCPServerStatus
 from .multi_agent import Orchestrator
@@ -341,9 +341,14 @@ class AgentSession:
 
     @property
     def lesson_store(self) -> LessonStore:
-        """Lazy-initialized cross-session lesson store."""
+        """Lesson store backed by the agent's nooa-memory MemoryManager."""
         if self._lesson_store is None:
-            self._lesson_store = get_default_store()
+            memory = getattr(self.agent, "_memory", None)
+            if memory is None:
+                raise RuntimeError(
+                    "Memory is not enabled. Set memory.enabled=true in settings."
+                )
+            self._lesson_store = LessonStore(memory)
         return self._lesson_store
 
     @property

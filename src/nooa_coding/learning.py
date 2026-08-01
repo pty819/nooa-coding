@@ -1,17 +1,26 @@
-"""Cross-session learning: extract and recall lessons from past failures."""
+"""Cross-session learning: extract and recall lessons from past failures.
+
+Backed by nooa-memory's MemoryManager — lessons are stored as SKILL-type
+memories with a ``lesson`` tag, gaining vector retrieval, dedup-on-write,
+reinforcement, reflection/consolidation, and forgetting for free.
+"""
 
 from __future__ import annotations
 
-import sqlite3
-from datetime import UTC, datetime
-from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
+
+if TYPE_CHECKING:
+    from nooa_memory import MemoryManager
+    from nooa_memory.schema import Memory
+
+# Tag prefix used to distinguish lessons from other memories.
+LESSON_TAG = "lesson"
 
 
 class Lesson(BaseModel):
-    """A durable lesson extracted from a coding session."""
+    """A durable lesson extracted from a coding session (view model)."""
 
     lesson_id: str = ""
     category: str = "general"  # "bug", "pattern", "tool", "workflow", "general"
@@ -19,70 +28,66 @@ class Lesson(BaseModel):
     content: str
     context: str = ""  # What was being attempted
     source_session: str = ""
-    created_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
+    created_at: str = ""
     recall_count: int = 0
     last_recalled: str | None = None
 
 
+def _memory_to_lesson(mem: Memory) -> Lesson:
+    """Convert a nooa-memory Memory object to our Lesson view model."""
+    tags = mem.tags or []
+    category = "general"
+    for tag in tags:
+        if tag.startswith("cat:"):
+            category = tag[4:]
+            break
+
+    return Lesson(
+        lesson_id=mem.id,
+        category=category,
+        title=mem.title or mem.content[:80],
+        content=mem.content,
+        context=getattr(mem, "source_task_ref", "") or "",
+        source_session="",
+        created_at=str(mem.created_at) if hasattr(mem, "created_at") else "",
+        recall_count=getattr(mem, "reinforcement_count", 0),
+        last_recalled=None,
+    )
+
+
 class LessonStore:
-    """Persistent storage for cross-session lessons using SQLite."""
+    """Persistent storage for cross-session lessons backed by MemoryManager.
 
-    def __init__(self, db_path: str | Path) -> None:
-        self._db_path = Path(db_path).expanduser()
-        self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self._db_path))
-        self._conn.row_factory = sqlite3.Row
-        self._init_schema()
+    This is a thin adapter that maps the lesson API onto nooa-memory's
+    remember/recall/forget, giving us vector similarity search, dedup,
+    reinforcement, and reflection for free.
+    """
 
-    def _init_schema(self) -> None:
-        self._conn.execute("""
-            CREATE TABLE IF NOT EXISTS lessons (
-                lesson_id TEXT PRIMARY KEY,
-                category TEXT NOT NULL DEFAULT 'general',
-                title TEXT NOT NULL,
-                content TEXT NOT NULL,
-                context TEXT DEFAULT '',
-                source_session TEXT DEFAULT '',
-                created_at TEXT NOT NULL,
-                recall_count INTEGER DEFAULT 0,
-                last_recalled TEXT
-            )
-        """)
-        self._conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_lessons_category ON lessons(category)
-        """)
-        self._conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_lessons_created ON lessons(created_at)
-        """)
-        self._conn.commit()
+    def __init__(self, memory: MemoryManager) -> None:
+        self._memory = memory
 
     def add(self, lesson: Lesson) -> str:
-        """Store a new lesson. Returns the lesson_id."""
-        import uuid
+        """Store a new lesson. Returns the lesson_id (memory id)."""
+        from nooa_memory.schema import MemoryType
 
-        if not lesson.lesson_id:
-            lesson.lesson_id = uuid.uuid4().hex[:12]
+        tags = [LESSON_TAG, f"cat:{lesson.category}"]
+        if lesson.source_session:
+            tags.append(f"session:{lesson.source_session[:12]}")
 
-        self._conn.execute(
-            """
-            INSERT OR REPLACE INTO lessons
-            (lesson_id, category, title, content, context, source_session, created_at, recall_count, last_recalled)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                lesson.lesson_id,
-                lesson.category,
-                lesson.title,
-                lesson.content,
-                lesson.context,
-                lesson.source_session,
-                lesson.created_at,
-                lesson.recall_count,
-                lesson.last_recalled,
-            ),
+        content = lesson.content
+        if lesson.context:
+            content = f"{lesson.content}\n\nContext: {lesson.context}"
+
+        memory_id = self._memory.remember(
+            content,
+            type=MemoryType.SKILL,
+            title=lesson.title,
+            tags=tags,
+            importance=0.7,
+            source_task_ref=lesson.context or None,
+            dedup=True,
         )
-        self._conn.commit()
-        return lesson.lesson_id
+        return memory_id
 
     def recall(
         self,
@@ -91,64 +96,56 @@ class LessonStore:
         category: str | None = None,
         limit: int = 5,
     ) -> list[Lesson]:
-        """Recall relevant lessons, optionally filtered by category or keyword."""
-        conditions: list[str] = []
-        params: list[Any] = []
+        """Recall relevant lessons using vector similarity search."""
+        if not query:
+            # No query — return recent lessons.
+            return self.recent(limit=limit)
 
-        if category:
-            conditions.append("category = ?")
-            params.append(category)
-
-        if query:
-            conditions.append("(title LIKE ? OR content LIKE ? OR context LIKE ?)")
-            like = f"%{query}%"
-            params.extend([like, like, like])
-
-        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-        sql = f"SELECT * FROM lessons {where} ORDER BY created_at DESC LIMIT ?"
-        params.append(limit)
-
-        rows = self._conn.execute(sql, params).fetchall()
-        lessons = [Lesson(**dict(row)) for row in rows]
-
-        # Update recall stats.
-        now = datetime.now(UTC).isoformat()
-        for lesson in lessons:
-            self._conn.execute(
-                "UPDATE lessons SET recall_count = recall_count + 1, last_recalled = ? WHERE lesson_id = ?",
-                (now, lesson.lesson_id),
-            )
-        self._conn.commit()
-
+        memories = self._memory.recall(query, k=limit * 2)
+        lessons = []
+        for mem in memories:
+            # Filter to lesson-tagged memories only.
+            if LESSON_TAG not in (mem.tags or []):
+                continue
+            if category:
+                if f"cat:{category}" not in (mem.tags or []):
+                    continue
+            lessons.append(_memory_to_lesson(mem))
+            if len(lessons) >= limit:
+                break
         return lessons
 
     def recent(self, limit: int = 10) -> list[Lesson]:
         """Get the most recent lessons."""
-        rows = self._conn.execute(
-            "SELECT * FROM lessons ORDER BY created_at DESC LIMIT ?", (limit,)
-        ).fetchall()
-        return [Lesson(**dict(row)) for row in rows]
+        # Use store directly to get all lesson memories sorted by time.
+        all_mems = self._memory.store.all_memories(owner=self._memory.role)
+        lesson_mems = [
+            m for m in all_mems if LESSON_TAG in (m.tags or [])
+        ]
+        # Sort by created_at descending.
+        lesson_mems.sort(key=lambda m: m.created_at, reverse=True)
+        return [_memory_to_lesson(m) for m in lesson_mems[:limit]]
 
     def stats(self) -> dict[str, Any]:
         """Return store statistics."""
-        total = self._conn.execute("SELECT COUNT(*) FROM lessons").fetchone()[0]
-        by_category = dict(
-            self._conn.execute(
-                "SELECT category, COUNT(*) FROM lessons GROUP BY category"
-            ).fetchall()
-        )
-        return {"total": total, "by_category": by_category}
+        all_mems = self._memory.store.all_memories(owner=self._memory.role)
+        lesson_mems = [m for m in all_mems if LESSON_TAG in (m.tags or [])]
+        by_category: dict[str, int] = {}
+        for m in lesson_mems:
+            cat = "general"
+            for tag in m.tags or []:
+                if tag.startswith("cat:"):
+                    cat = tag[4:]
+                    break
+            by_category[cat] = by_category.get(cat, 0) + 1
+        return {"total": len(lesson_mems), "by_category": by_category}
 
     def delete(self, lesson_id: str) -> bool:
         """Delete a lesson by ID. Returns True if deleted."""
-        cursor = self._conn.execute(
-            "DELETE FROM lessons WHERE lesson_id = ?", (lesson_id,)
-        )
-        self._conn.commit()
-        return cursor.rowcount > 0
+        return self._memory.forget(lesson_id)
 
     def close(self) -> None:
-        self._conn.close()
+        """No-op — MemoryManager lifecycle is owned by the agent."""
 
 
 class LessonExtractor:
@@ -224,21 +221,8 @@ class LessonExtractor:
         return lesson
 
     def recall_relevant(self, task: str, limit: int = 3) -> list[Lesson]:
-        """Recall lessons that might be relevant to a new task."""
-        # Extract keywords from the task for matching.
-        keywords = [w for w in task.lower().split() if len(w) > 3][:5]
-        lessons: list[Lesson] = []
-        seen_ids: set[str] = set()
-
-        for keyword in keywords:
-            for lesson in self._store.recall(keyword, limit=2):
-                if lesson.lesson_id not in seen_ids:
-                    lessons.append(lesson)
-                    seen_ids.add(lesson.lesson_id)
-            if len(lessons) >= limit:
-                break
-
-        return lessons[:limit]
+        """Recall lessons that might be relevant to a new task via vector search."""
+        return self._store.recall(task, limit=limit)
 
     def format_for_context(self, lessons: list[Lesson]) -> str:
         """Format lessons as context to inject into the system prompt."""
@@ -250,15 +234,9 @@ class LessonExtractor:
         return "\n".join(lines)
 
 
-def get_default_store() -> LessonStore:
-    """Get the default lesson store location."""
-    default_path = Path.home() / ".config" / "nooa-coding" / "lessons.db"
-    return LessonStore(default_path)
-
-
 __all__ = [
+    "LESSON_TAG",
     "Lesson",
     "LessonExtractor",
     "LessonStore",
-    "get_default_store",
 ]
