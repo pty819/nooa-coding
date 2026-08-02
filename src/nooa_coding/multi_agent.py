@@ -65,10 +65,12 @@ class TaskPackage(BaseModel):
 
     task_id: str = Field(default_factory=lambda: uuid.uuid4().hex[:8])
     objective: str
+    role: str = ""
     context_summary: str = ""
     file_scope: list[str] = Field(default_factory=list)
     constraints: list[str] = Field(default_factory=list)
     expected_output: str = ""
+    read_only: bool = False
     base_commit: str = "HEAD"
     token_budget: int = 100_000
     timeout_seconds: float = 600
@@ -77,6 +79,8 @@ class TaskPackage(BaseModel):
     def build_prompt(self) -> str:
         """Construct the enriched prompt injected into the sub-agent session."""
         parts: list[str] = []
+        if self.role:
+            parts.append(f"## Your Role\n{self.role}")
         parts.append(f"## Task: {self.objective}")
         if self.context_summary:
             parts.append(f"\n## Background\n{self.context_summary}")
@@ -260,7 +264,7 @@ class Coordinator:
         sub_session._is_sub_agent = True  # noqa: SLF001
 
         # Apply restricted permissions.
-        self._apply_restrictions(sub_session)
+        self._apply_restrictions(sub_session, task)
 
         # Build the enriched prompt.
         prompt = task.build_prompt()
@@ -473,13 +477,14 @@ class Coordinator:
                 timeout=10,
             )
 
-    def _apply_restrictions(self, session: AgentSession) -> None:
+    def _apply_restrictions(self, session: AgentSession, task: TaskPackage | None = None) -> None:
         """Apply restricted permissions to a sub-agent session."""
         from .config import PermissionSettings
 
+        read_only = bool(task and task.read_only)
         restricted = PermissionSettings(
             file_read="allow",
-            file_write="allow",  # Within its own worktree.
+            file_write="deny" if read_only else "allow",  # read-only roles cannot write.
             shell="allow",  # Only whitelisted commands pass.
             allow_shell=self._settings.allow_shell,
             deny_shell=self._settings.deny_shell,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from conftest import coding_response, fake_llm, response_with_code
@@ -119,7 +120,9 @@ async def test_change_completion_requires_a_new_host_observed_change(
     try:
         result = await session.prompt("implement the requested change")
         assert result.status == "verification_failed"
-        assert result.changed_files == ["preexisting.txt"]
+        # The pre-turn auto-checkpoint commits preexisting.txt, so the turn
+        # itself produces no *new* worktree change.
+        assert result.changed_files == []
         assert "no new worktree change" in result.evidence
     finally:
         await session.close()
@@ -405,6 +408,69 @@ async def test_permission_switch_updates_policy(git_repo: Path, settings) -> Non
 
         with pytest.raises(ValueError, match="unknown permission mode"):
             session.switch_permissions("invalid")
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_permission_switch_auto_edit(git_repo: Path, settings) -> None:
+    """auto-edit auto-approves file ops but still asks for shell."""
+    manager = AgentSessionManager(git_repo, settings)
+    session = manager.create("auto-edit", llm=FakeLLMClient(scripted_responses=[]))
+    try:
+        policy = session.agent.shell._policy  # noqa: SLF001
+        session.switch_permissions("auto-edit")
+        assert policy.settings.file_read == "allow"
+        assert policy.settings.file_write == "allow"
+        assert policy.settings.shell == "ask"
+        # Aliases resolve to the same posture.
+        session.switch_permissions("auto")
+        assert policy.settings.shell == "ask"
+        assert policy.settings.file_write == "allow"
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_undo_reverts_last_turn_change(git_repo: Path, settings) -> None:
+    """Each turn is bracketed by an auto-checkpoint that /undo can revert."""
+    manager = AgentSessionManager(git_repo, settings)
+    session = manager.create("undo", llm=fake_llm(coding_response()))
+    try:
+        result = await session.prompt("create the fixture output")
+        assert result.status == "completed"
+        assert (session.workspace / "result.txt").exists()
+
+        checkpoint = session.undo()
+        assert checkpoint.label.startswith("auto-turn")
+        assert not (session.workspace / "result.txt").exists()
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_undo_without_any_turn_raises(git_repo: Path, settings) -> None:
+    manager = AgentSessionManager(git_repo, settings)
+    session = manager.create("undo-empty", llm=FakeLLMClient(scripted_responses=[]))
+    try:
+        with pytest.raises(KeyError, match="nothing to undo"):
+            session.undo()
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_context_window_resolution_and_current_tokens(
+    git_repo: Path, settings
+) -> None:
+    manager = AgentSessionManager(git_repo, settings)
+    session = manager.create("ctx", llm=fake_llm(coding_response()))
+    try:
+        assert session.current_context_tokens == 0
+        with patch("nooa_coding.llm.resolve_context_window", return_value=99_000):
+            assert session.context_window == 99_000
+        # Resolved value is cached on the session.
+        assert session.context_window == 99_000
     finally:
         await session.close()
 

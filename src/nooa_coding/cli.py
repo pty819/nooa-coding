@@ -30,38 +30,41 @@ from .terminal import TerminalRenderer
 console = Console()
 renderer = TerminalRenderer(console)
 
-_SLASH_COMMANDS = [
-    "/help",
-    "/diff",
-    "/checkpoint",
-    "/rollback",
-    "/compact",
-    "/fork",
-    "/approvals",
-    "/approve",
-    "/deny",
-    "/replay",
-    "/reload",
-    "/mcp",
-    "/cost",
-    "/status",
-    "/clear",
-    "/model",
-    "/permissions",
-    "/review",
-    "/plan",
-    "/suggest",
-    "/goal",
-    "/search",
-    "/export",
-    "/workspace",
-    "/init",
-    "/pr",
-    "/orchestrate",
-    "/lessons",
-    "/report",
-    "/exit",
-]
+_SLASH_COMMANDS: dict[str, str] = {
+    "/help": "Show command list",
+    "/diff": "Show worktree status and patch",
+    "/checkpoint": "Save a recoverable checkpoint",
+    "/rollback": "Restore files and agent state",
+    "/undo": "Undo the last turn (restore pre-turn snapshot)",
+    "/agents": "List preset sub-agents",
+    "/agent": "Run a preset sub-agent: /agent NAME TASK",
+    "/compact": "Compress older conversation history",
+    "/fork": "Fork the conversation and worktree",
+    "/approvals": "List pending tool approvals",
+    "/approve": "Approve pending operation (y)",
+    "/deny": "Deny pending operation (n)",
+    "/replay": "Show recent durable events",
+    "/reload": "Reload AGENTS.md and skills",
+    "/mcp": "External MCP server management",
+    "/cost": "Show token usage and cost",
+    "/status": "Show session status panel",
+    "/clear": "Clear conversation history",
+    "/model": "Show or switch the active model",
+    "/permissions": "Switch mode: yolo/auto-edit/ask/default",
+    "/review": "LLM code review of current diff",
+    "/plan": "Generate a plan without executing",
+    "/suggest": "Generate a diff suggestion",
+    "/goal": "Set a goal; auto-continue until achieved",
+    "/search": "Web search and return results",
+    "/export": "Export session events to JSONL",
+    "/workspace": "Print the isolated worktree path",
+    "/init": "Analyze repo and generate AGENTS.md",
+    "/pr": "Push branch and create a pull request",
+    "/orchestrate": "Decompose and execute a complex task",
+    "/lessons": "Show stored lessons",
+    "/report": "Write session report (json/html)",
+    "/exit": "Save and exit",
+}
 
 
 class SlashCompleter(Completer):
@@ -74,9 +77,13 @@ class SlashCompleter(Completer):
         text = document.text_before_cursor
         # Slash command completion at start of input.
         if text.startswith("/"):
-            for command in _SLASH_COMMANDS:
+            for command, description in _SLASH_COMMANDS.items():
                 if command.startswith(text) and command != text:
-                    yield Completion(command, start_position=-len(text))
+                    yield Completion(
+                        command,
+                        start_position=-len(text),
+                        display_meta=description,
+                    )
             return
         # @file mention completion: find the last @token in the input.
         at_idx = text.rfind("@")
@@ -93,7 +100,7 @@ class SlashCompleter(Completer):
         if self._workspace is None or not self._workspace.is_dir():
             return
         prefix_len = len(full_text) - at_idx  # includes the @
-        matches: list[str] = []
+        matches: list[tuple[str, str]] = []
         try:
             for path in sorted(self._workspace.rglob("*")):
                 if len(matches) >= 20:
@@ -105,13 +112,18 @@ class SlashCompleter(Completer):
                 if "__pycache__" in rel or "node_modules" in rel:
                     continue
                 if query.lower() in rel.lower():
+                    kind = "dir" if path.is_dir() else "file"
                     suffix = "/" if path.is_dir() else ""
-                    matches.append(rel + suffix)
+                    matches.append((rel + suffix, kind))
         except OSError:
             return
-        for match in matches:
+        for match, kind in matches:
             display = f"@{match}"
-            yield Completion(display, start_position=-prefix_len)
+            yield Completion(
+                display,
+                start_position=-prefix_len,
+                display_meta=kind,
+            )
 
 
 def _build_key_bindings() -> KeyBindings:
@@ -417,6 +429,7 @@ async def _interactive(manager: AgentSessionManager, session: AgentSession) -> N
         key_bindings=_build_key_bindings(),
         multiline=False,  # Enter sends; Ctrl+J inserts newline via bindings
         enable_history_search=True,
+        complete_while_typing=True,
     )
     renderer.banner(session.session_id, session.current_model, session.workspace)
 
@@ -425,15 +438,28 @@ async def _interactive(manager: AgentSessionManager, session: AgentSession) -> N
         return HTML(f"<b><ansiblue>{model_short}</ansiblue></b> <dim>❯</dim> ")
 
     def _bottom_toolbar() -> HTML:
+        usage = session.token_usage
+        ctx_used = session.current_context_tokens
+        ctx_max = session.context_window
+        pct = int(100 * ctx_used / ctx_max) if ctx_max else 0
+        # Color the context fill by pressure.
+        ctx_color = "ansigreen" if pct < 60 else ("ansiyellow" if pct < 85 else "ansired")
+        hud = (
+            f"<b><{ctx_color}>ctx {ctx_used / 1000:.1f}k/{ctx_max / 1000:.0f}k"
+            f" ({pct}%)</{ctx_color}></b>"
+            f" · <ansicyan>↑{usage.total_prompt_tokens / 1000:.1f}k</ansicyan>"
+            f" <ansimagenta>↓{usage.total_completion_tokens / 1000:.1f}k</ansimagenta>"
+        )
+        if usage.total_cost_usd > 0:
+            hud += f" · <ansiyellow>${usage.total_cost_usd:.3f}</ansiyellow>"
         goal_hint = ""
         if session.goal and session.goal.status == "active":
-            goal_hint = f" | <ansicyan>◎ goal {session.goal.turns_used}/{session.goal.turn_budget}</ansicyan>"
+            goal_hint = (
+                f" · <ansicyan>◎ {session.goal.turns_used}/{session.goal.turn_budget}</ansicyan>"
+            )
         return HTML(
-            " <dim>Ctrl+J</dim> newline"
-            " · <dim>Ctrl+G</dim> editor"
-            " · <dim>Tab</dim> complete"
-            " · <dim>/help</dim> commands"
-            f"{goal_hint}"
+            f" {hud}{goal_hint}"
+            "  <dim>| Ctrl+J nl · Ctrl+G editor · /help</dim>"
         )
 
     with patch_stdout(raw=True):
@@ -465,6 +491,86 @@ async def _interactive(manager: AgentSessionManager, session: AgentSession) -> N
                 console.print(
                     Text(f"Restored checkpoint {checkpoint.checkpoint_id}.", style="green")
                 )
+            elif text == "/undo":
+                try:
+                    checkpoint = session.undo()
+                    console.print(
+                        Text(
+                            f"↩ Undone to checkpoint {checkpoint.checkpoint_id} "
+                            f"({checkpoint.label}).",
+                            style="green",
+                        )
+                    )
+                except (KeyError, RuntimeError) as exc:
+                    console.print(Text(str(exc), style="yellow"))
+            elif text == "/agents":
+                from .presets import PRESET_AGENTS
+
+                table_rows = [
+                    (name, preset.title, preset.description, "read-only" if preset.read_only else "write")
+                    for name, preset in PRESET_AGENTS.items()
+                ]
+                from rich.table import Table as RichTable
+
+                agents_table = RichTable(title="Preset sub-agents", box=None, show_header=True)
+                agents_table.add_column("Name", style="bold cyan", no_wrap=True)
+                agents_table.add_column("Title", style="white")
+                agents_table.add_column("Description")
+                agents_table.add_column("Mode", style="dim")
+                for name, title, description, mode in table_rows:
+                    agents_table.add_row(name, title, description, mode)
+                console.print(agents_table)
+                console.print(
+                    Text("Use /agent NAME TASK to run one.", style="dim")
+                )
+            elif text.startswith("/agent "):
+                parts = text.split(maxsplit=2)
+                if len(parts) < 3:
+                    console.print(
+                        Text("Usage: /agent NAME TASK", style="yellow")
+                    )
+                else:
+                    agent_name, objective = parts[1], parts[2]
+                    from .presets import get_preset
+
+                    try:
+                        preset = get_preset(agent_name)
+                    except KeyError as exc:
+                        console.print(Text(str(exc), style="yellow"))
+                    else:
+                        console.print(
+                            Text(
+                                f"⟳ Spawning {preset.title}: {objective[:70]}…",
+                                style="dim italic",
+                            )
+                        )
+
+                        def _agent_progress(report):  # noqa: ANN001, ANN201
+                            icon = "✓" if report.status == "completed" else "✗"
+                            style = "green" if report.status == "completed" else "red"
+                            console.print(
+                                Text(
+                                    f"    {icon} {report.summary[:60] or report.error[:60]}",
+                                    style=style,
+                                )
+                            )
+
+                        report = await session.delegate_preset(
+                            agent_name, objective, on_progress=_agent_progress
+                        )
+                        if report.status == "completed":
+                            console.print(
+                                Text(f"✓ {preset.title} finished", style="green")
+                            )
+                            if report.summary:
+                                console.print(Markdown(report.summary))
+                        else:
+                            console.print(
+                                Text(
+                                    f"✗ {preset.title} {report.status}: {report.error[:200]}",
+                                    style="red",
+                                )
+                            )
             elif text == "/compact":
                 console.print(f"summary tag: {await session.compact()}")
             elif text.startswith("/fork"):
@@ -680,7 +786,7 @@ async def _interactive(manager: AgentSessionManager, session: AgentSession) -> N
                         )
                     )
                     console.print(
-                        Text("Use /permissions yolo|ask|default to switch.", style="dim")
+                        Text("Use /permissions yolo|auto-edit|ask|default to switch.", style="dim")
                     )
                 else:
                     try:
@@ -991,9 +1097,14 @@ def main(
         if not settings.models:
             raise click.UsageError("configure coding_agent.models or pass --model")
         if resume:
-            if not session_id:
-                raise click.UsageError("--resume requires --session")
-            session = manager.resume(session_id)
+            if session_id:
+                session = manager.resume(session_id)
+            else:
+                existing = manager.list()
+                if not existing:
+                    raise click.UsageError("no existing session to resume for this repo")
+                session = manager.resume(existing[0].session_id)
+                click.echo(f"Resuming last session: {session.session_id}")
         elif session_id and manager.session_dir(session_id).exists():
             session = manager.resume(session_id)
         else:

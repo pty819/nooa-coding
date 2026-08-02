@@ -104,6 +104,8 @@ class AgentSession:
         self._closed = False
         self._session_start_fired = False
         self._token_usage = TokenUsage()
+        self._last_prompt_tokens = 0
+        self._resolved_context_window: int | None = None
         self._goal: GoalState | None = None
         self._coordinator: Coordinator | None = None
         self._is_sub_agent = False
@@ -192,11 +194,22 @@ class AgentSession:
         raise ValueError(f"unknown model '{model_name}'. Available: {available}")
 
     def switch_permissions(self, mode: str) -> None:
-        """Switch permission mode at runtime: 'yolo', 'allow', 'ask', or 'default'."""
+        """Switch permission mode at runtime.
+
+        Supported modes:
+        - ``yolo`` / ``allow``: auto-approve reads, writes, and shell.
+        - ``auto-edit``: auto-approve file reads/writes, but still ask for shell.
+        - ``ask``: ask for writes and shell (reads stay allowed).
+        - ``default``: restore the configured settings.
+        """
         policy = self.agent.shell._policy  # noqa: SLF001
         if mode in ("allow", "yolo"):
             policy.settings = self.settings.permissions.model_copy(
                 update={"file_read": "allow", "file_write": "allow", "shell": "allow"}
+            )
+        elif mode in ("auto-edit", "autoedit", "auto"):
+            policy.settings = self.settings.permissions.model_copy(
+                update={"file_read": "allow", "file_write": "allow", "shell": "ask"}
             )
         elif mode == "ask":
             policy.settings = self.settings.permissions.model_copy(
@@ -205,7 +218,9 @@ class AgentSession:
         elif mode == "default":
             policy.settings = self.settings.permissions
         else:
-            raise ValueError(f"unknown permission mode '{mode}'. Use: yolo, ask, default")
+            raise ValueError(
+                f"unknown permission mode '{mode}'. Use: yolo, auto-edit, ask, default"
+            )
         self._emit("session", "permissions_changed", {"mode": mode})
 
     async def review(self) -> str:
@@ -382,6 +397,31 @@ class AgentSession:
             },
         )
         return reports
+
+    async def delegate_preset(
+        self, preset_name: str, objective: str, *, on_progress: Any = None
+    ) -> WorkerReport:
+        """Run a single preset sub-agent and merge its work if it produced commits.
+
+        Read-only presets (search, explore, architect, pm) never write, so their
+        reports are returned without a merge step.
+        """
+        from .presets import build_preset_task, get_preset
+
+        preset = get_preset(preset_name)
+        task = build_preset_task(
+            preset,
+            objective,
+            context_summary=f"Delegated by session {self.session_id}",
+            base_commit="HEAD",
+            timeout_seconds=self.settings.subagent.timeout_seconds,
+            token_budget=self.settings.subagent.token_budget,
+        )
+        reports = await self.delegate_tasks([task], on_progress=on_progress)
+        report = reports[0]
+        if not preset.read_only and report.status == "completed" and report.commits:
+            self.merge_subagent_results([report])
+        return report
 
     def merge_subagent_results(self, reports: list[WorkerReport]) -> MergeResult:
         """Merge sub-agent worktree commits into this session's worktree."""
@@ -571,8 +611,10 @@ class AgentSession:
         usage = getattr(response, "usage", None)
         if usage is None:
             return
+        prompt_tokens = getattr(usage, "prompt_tokens", 0)
+        self._last_prompt_tokens = prompt_tokens
         self._token_usage.add(
-            prompt_tokens=getattr(usage, "prompt_tokens", 0),
+            prompt_tokens=prompt_tokens,
             completion_tokens=getattr(usage, "completion_tokens", 0),
             cached_tokens=getattr(usage, "cached_tokens", 0),
             reasoning_tokens=getattr(usage, "reasoning_tokens", 0),
@@ -592,6 +634,20 @@ class AgentSession:
     @property
     def token_usage(self) -> TokenUsage:
         return self._token_usage.model_copy()
+
+    @property
+    def current_context_tokens(self) -> int:
+        """Prompt tokens of the most recent LLM call (current context fill)."""
+        return self._last_prompt_tokens
+
+    @property
+    def context_window(self) -> int:
+        """Resolved context window size for the active model (cached)."""
+        if self._resolved_context_window is None:
+            from .llm import resolve_context_window
+
+            self._resolved_context_window = resolve_context_window(self.llm)
+        return self._resolved_context_window
 
     def _on_nooa_event(self, event: Any) -> None:
         event_type = getattr(event, "event_type", type(event).__name__)
@@ -618,8 +674,11 @@ class AgentSession:
             return
         # Accumulate token usage from LLMComplete metrics.
         if event_type == "LLMComplete":
+            prompt_tokens = getattr(event, "prompt_tokens", 0)
+            if prompt_tokens:
+                self._last_prompt_tokens = prompt_tokens
             self._token_usage.add(
-                prompt_tokens=getattr(event, "prompt_tokens", 0),
+                prompt_tokens=prompt_tokens,
                 completion_tokens=getattr(event, "completion_tokens", 0),
                 cached_tokens=getattr(event, "cached_tokens", 0),
                 reasoning_tokens=getattr(event, "reasoning_tokens", 0),
@@ -675,7 +734,7 @@ class AgentSession:
                 raise RuntimeError("session already has an active turn")
             run_id = uuid.uuid4().hex
             self._set_status("running")
-            self._save_snapshot()
+            self._auto_checkpoint()
             self._emit("session", "turn_started", {"run_id": run_id, "prompt": task})
             self._active_task = asyncio.create_task(
                 self.agent.run_task(task, continued=bool(self.agent.task)),
@@ -798,6 +857,39 @@ class AgentSession:
         self._persist_metadata()
         self._emit("checkpoint", "checkpoint_created", checkpoint.model_dump(mode="json"))
         return checkpoint
+
+    def _auto_checkpoint(self) -> None:
+        """Snapshot agent state and commit the worktree before a turn runs.
+
+        This powers ``/undo``: each turn is bracketed by a recoverable checkpoint
+        so the previous turn's changes can be reverted exactly.
+        """
+        snapshot_id = self._save_snapshot()
+        checkpoint = WorkspaceManager.checkpoint(
+            self.workspace, f"auto-turn-{self._sequence}"
+        ).model_copy(update={"snapshot_id": snapshot_id})
+        self.metadata.checkpoints.append(checkpoint)
+        self._persist_metadata()
+
+    def undo(self) -> Checkpoint:
+        """Revert the worktree and agent state to before the most recent turn."""
+        if self._active_task is not None:
+            raise RuntimeError("cannot undo while a turn is running")
+        auto = [c for c in self.metadata.checkpoints if c.label.startswith("auto-turn")]
+        if not auto:
+            raise KeyError("nothing to undo")
+        target = auto[-1]
+        # Drop this checkpoint so a repeated /undo steps further back.
+        self.metadata.checkpoints = [
+            c for c in self.metadata.checkpoints if c is not target
+        ]
+        WorkspaceManager.rollback(self.workspace, target)
+        if target.snapshot_id:
+            self.storage.restore_snapshot(target.snapshot_id, self.agent)
+        self._persist_metadata()
+        self._emit("checkpoint", "undo", target.model_dump(mode="json"))
+        self._save_snapshot()
+        return target
 
     def rollback(self, checkpoint_id: str) -> Checkpoint:
         if self._active_task is not None:

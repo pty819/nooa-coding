@@ -120,3 +120,52 @@ def test_build_llm_falls_back_to_env(monkeypatch: pytest.MonkeyPatch) -> None:
         mock_get.return_value = StubLLM("openai/gpt-5")
         build_llm((endpoint,))
     mock_get.assert_called_once_with("openai/gpt-5", client_type=None, api_key="env-secret")
+
+
+def test_resolve_context_window_uses_declared_value() -> None:
+    from types import SimpleNamespace
+
+    from nooa_coding.llm import resolve_context_window
+
+    client = SimpleNamespace(context_window=128_000, model="x")
+    assert resolve_context_window(client) == 128_000  # type: ignore[arg-type]
+
+
+def test_resolve_context_window_uses_litellm_info() -> None:
+    from types import SimpleNamespace
+
+    from nooa_coding.llm import resolve_context_window
+
+    client = SimpleNamespace(model="openai/gpt-4o", api_base=None, api_key=None)
+    with patch(
+        "nooa_coding.llm.litellm.get_model_info",
+        return_value={"max_input_tokens": 200_000},
+    ):
+        assert resolve_context_window(client) == 200_000  # type: ignore[arg-type]
+
+
+def test_resolve_context_window_uses_models_endpoint() -> None:
+    from types import SimpleNamespace
+
+    from nooa_coding.llm import resolve_context_window
+
+    client = SimpleNamespace(model="custom", api_base="http://x", api_key="k")
+    with (
+        patch("nooa_coding.llm.litellm.get_model_info", side_effect=Exception("nope")),
+        patch("nooa_coding.llm._context_from_models_endpoint", return_value=131_072),
+    ):
+        assert resolve_context_window(client) == 131_072  # type: ignore[arg-type]
+
+
+def test_resolve_context_window_falls_back_to_default() -> None:
+    from types import SimpleNamespace
+
+    from nooa_coding.llm import DEFAULT_CONTEXT_WINDOW, resolve_context_window
+
+    client = SimpleNamespace(model="unknown-model-xyz", api_base=None, api_key=None)
+    with (
+        patch("nooa_coding.llm.litellm.get_model_info", side_effect=Exception("nope")),
+        patch("nooa_coding.llm._context_from_models_endpoint", return_value=None),
+    ):
+        assert resolve_context_window(client) == DEFAULT_CONTEXT_WINDOW  # type: ignore[arg-type]
+    assert DEFAULT_CONTEXT_WINDOW == 256_000

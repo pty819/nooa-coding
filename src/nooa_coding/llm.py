@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import os
+import urllib.request
 from collections.abc import Callable
 from typing import Any
 
@@ -17,6 +19,18 @@ from .system_prompt import bind_active_model
 litellm.suppress_debug_info = True
 
 FailoverSink = Callable[[str, str, str], None]
+
+# Fallback context window when nothing else can determine it.
+DEFAULT_CONTEXT_WINDOW = 256_000
+
+# Fields providers use to advertise context length in /v1/models payloads.
+_CONTEXT_FIELDS = (
+    "context_length",
+    "context_window",
+    "max_input_tokens",
+    "max_context_length",
+    "max_model_len",
+)
 
 
 class FailoverLLM(UnifiedLLM):
@@ -144,4 +158,75 @@ def build_llm(
     return FailoverLLM(clients, on_failover=on_failover)
 
 
-__all__ = ["FailoverLLM", "build_llm"]
+def _context_from_models_endpoint(model: str, api_base: str | None, api_key: str | None) -> int | None:
+    """Best-effort lookup of a model's context length via the provider /models API."""
+    if not api_base:
+        return None
+    base = api_base.rstrip("/")
+    candidates = [f"{base}/v1/models", f"{base}/models"]
+    headers = {"User-Agent": "nooa-coding/0.1"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    for url in candidates:
+        try:
+            req = urllib.request.Request(url, headers=headers)  # noqa: S310
+            with urllib.request.urlopen(req, timeout=8) as resp:  # noqa: S310
+                payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+        except Exception:
+            continue
+        entries = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(entries, list):
+            continue
+        short = model.split("/")[-1]
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            entry_id = str(entry.get("id") or entry.get("model") or "")
+            if entry_id not in (model, short):
+                continue
+            for field in _CONTEXT_FIELDS:
+                value = entry.get(field)
+                if isinstance(value, int) and value > 0:
+                    return value
+            nested = entry.get("context_length") or entry.get("model_info")
+            if isinstance(nested, dict):
+                for field in _CONTEXT_FIELDS:
+                    value = nested.get(field)
+                    if isinstance(value, int) and value > 0:
+                        return value
+    return None
+
+
+def resolve_context_window(llm: UnifiedLLM) -> int:
+    """Determine the active model's context window size in tokens.
+
+    Resolution order:
+    1. The client's own ``context_window`` (config / registry / litellm info).
+    2. litellm ``get_model_info`` for known models.
+    3. The provider ``/v1/models`` endpoint, if reachable.
+    4. ``DEFAULT_CONTEXT_WINDOW`` (256k) as a safe fallback.
+    """
+    active = getattr(llm, "active", llm)
+    declared = getattr(active, "context_window", None)
+    if isinstance(declared, int) and declared > 0:
+        return declared
+
+    model = str(getattr(active, "model", getattr(llm, "model", "")) or "")
+    try:
+        info = litellm.get_model_info(model)
+        max_tokens = info.get("max_input_tokens") or info.get("max_tokens")
+        if isinstance(max_tokens, int) and max_tokens > 0:
+            return max_tokens
+    except Exception:
+        pass
+
+    api_base = getattr(active, "api_base", None)
+    api_key = getattr(active, "api_key", None)
+    from_endpoint = _context_from_models_endpoint(model, api_base, api_key)
+    if from_endpoint:
+        return from_endpoint
+
+    return DEFAULT_CONTEXT_WINDOW
+
+
+__all__ = ["DEFAULT_CONTEXT_WINDOW", "FailoverLLM", "build_llm", "resolve_context_window"]
