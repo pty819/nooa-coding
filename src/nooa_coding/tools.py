@@ -25,16 +25,22 @@ class CodeSearch(Skill):
         *,
         file_glob: Annotated[str | None, spec(description="File glob filter, e.g. '*.py'")] = None,
         max_results: Annotated[int, spec(description="Maximum results to return")] = 30,
+        context_lines: Annotated[int, spec(description="Lines of context before/after each match")] = 0,
     ) -> str:
-        """Search file contents using ripgrep. Returns matching lines with paths."""
+        """Search file contents using ripgrep. Returns matching lines with paths.
+
+        Set context_lines > 0 to see surrounding code (like grep -C).
+        """
         cmd = ["rg", "--line-number", "--no-heading", "--color=never", "-m", str(max_results)]
+        if context_lines > 0:
+            cmd.extend(["-C", str(context_lines)])
         if file_glob:
             cmd.extend(["--glob", file_glob])
         cmd.extend(["--", query, str(self._root)])
         result = await self._run(cmd)
         if not result.strip():
             return f"No matches found for: {query}"
-        lines = result.splitlines()[:max_results]
+        lines = result.splitlines()[:max_results * (context_lines * 2 + 1) + max_results]
         # Strip the root prefix for readability.
         prefix = str(self._root) + "/"
         cleaned = [line.replace(prefix, "") for line in lines]
@@ -59,6 +65,28 @@ class CodeSearch(Skill):
         if not matches:
             return f"No files matching: {pattern}"
         return "\n".join(matches)
+
+    async def read_range(
+        self,
+        path: Annotated[str, spec(description="File path relative to the worktree")],
+        start: Annotated[int, spec(description="Start line (1-based)")],
+        end: Annotated[int, spec(description="End line (inclusive)")],
+    ) -> str:
+        """Read a specific line range from a file for context expansion."""
+        target = self._root / path
+        if not target.is_file():
+            return f"File not found: {path}"
+        lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
+        if start < 1:
+            start = 1
+        if end > len(lines):
+            end = len(lines)
+        if start > end:
+            return f"Invalid range: {start}-{end}"
+        numbered = [
+            f"{i}: {lines[i - 1]}" for i in range(start, end + 1)
+        ]
+        return "\n".join(numbered)
 
     async def outline(
         self,
