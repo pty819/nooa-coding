@@ -122,6 +122,37 @@ class MCPSettings(BaseModel):
     permissions: MCPPermissionSettings = Field(default_factory=MCPPermissionSettings)
 
 
+class SubAgentSettings(BaseModel):
+    """Configuration for sub-agent spawning and execution."""
+
+    model_config = ConfigDict(frozen=True)
+
+    max_concurrent: int = Field(default=3, ge=1, le=10)
+    timeout_seconds: float = Field(default=600, gt=0)
+    token_budget: int = Field(default=100_000, gt=0)
+    allow_shell: tuple[str, ...] = (
+        "uv run pytest*",
+        "uv run ruff*",
+        "uv run pyright*",
+        "rg *",
+        "find *",
+        "ls*",
+        "pwd",
+        "git status*",
+        "git diff*",
+        "git log*",
+        "git show*",
+    )
+    deny_shell: tuple[str, ...] = (
+        "rm -rf*",
+        "git push*",
+        "git reset --hard*",
+        "git clean*",
+        "git merge*",
+        "git rebase*",
+    )
+
+
 class CodingSettings(BaseModel):
     """Complete local application settings."""
 
@@ -137,6 +168,7 @@ class CodingSettings(BaseModel):
     limits: LimitSettings = Field(default_factory=LimitSettings)
     resources: ResourceSettings = Field(default_factory=ResourceSettings)
     mcp: MCPSettings = Field(default_factory=MCPSettings)
+    subagent: SubAgentSettings = Field(default_factory=SubAgentSettings)
 
     @model_validator(mode="before")
     @classmethod
@@ -224,6 +256,7 @@ __all__ = [
     "ModelEndpoint",
     "PermissionSettings",
     "ResourceSettings",
+    "SubAgentSettings",
     "load_settings",
     "settings_paths",
 ]

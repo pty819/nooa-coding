@@ -348,6 +348,51 @@ def _handle_mcp_command(session: AgentSession, text: str) -> None:
         console.print(Text(f"MCP: {message}", style="yellow"))
 
 
+async def _decompose_objective(session: AgentSession, objective: str) -> list:
+    """Use LLM to decompose an objective into TaskPackages for sub-agents."""
+    from .multi_agent import TaskPackage
+
+    decompose_prompt = (
+        "You are a task orchestrator. Decompose the following objective into "
+        "2-5 concrete, independent sub-tasks that can be executed in parallel "
+        "by isolated worker agents.\n\n"
+        "Rules:\n"
+        "- Each sub-task must be self-contained and actionable.\n"
+        "- Sub-tasks must NOT depend on each other (they run in isolation).\n"
+        "- Keep each sub-task focused on ONE logical change.\n\n"
+        "Respond in this EXACT format (one task per line):\n"
+        "TASK: <description>\n"
+        "TASK: <description>\n"
+        "...\n\n"
+        f"OBJECTIVE: {objective}"
+    )
+    messages = [{"role": "user", "content": decompose_prompt}]
+    response = await session.llm.acall(messages)
+    if hasattr(session, "_track_direct_llm_call"):
+        session._track_direct_llm_call(response)  # noqa: SLF001
+    content = response.content or ""
+
+    tasks: list[TaskPackage] = []
+    for line in content.splitlines():
+        line = line.strip()
+        if line.upper().startswith("TASK:"):
+            desc = line[5:].strip()
+            if desc:
+                tasks.append(
+                    TaskPackage(
+                        objective=desc,
+                        context_summary=f"Part of: {objective}",
+                        base_commit="HEAD",
+                        timeout_seconds=session.settings.subagent.timeout_seconds,
+                        token_budget=session.settings.subagent.token_budget,
+                    )
+                )
+    if not tasks:
+        # Fallback: single task.
+        tasks = [TaskPackage(objective=objective, base_commit="HEAD")]
+    return tasks
+
+
 async def _interactive(manager: AgentSessionManager, session: AgentSession) -> None:
     terminal = PromptSession[str](
         completer=SlashCompleter(workspace=session.workspace),
@@ -463,33 +508,46 @@ async def _interactive(manager: AgentSessionManager, session: AgentSession) -> N
                     console.print(
                         Text(f"⟳ Decomposing: {objective[:80]}…", style="dim italic")
                     )
-                    orch = session.orchestrator
-                    plan = await orch.decompose(objective)
+                    # Use LLM to decompose into task packages.
+                    tasks = await _decompose_objective(session, objective)
                     console.print(
                         Text(
-                            f"  → {len(plan.subtasks)} sub-tasks ({plan.strategy})",
+                            f"  → {len(tasks)} sub-tasks (parallel isolated sessions)",
                             style="cyan",
                         )
                     )
-                    for i, st in enumerate(plan.subtasks, 1):
-                        console.print(Text(f"    {i}. {st.description}", style="dim"))
-                    console.print(Text("  Executing…", style="dim italic"))
+                    for i, tp in enumerate(tasks, 1):
+                        console.print(Text(f"    {i}. {tp.objective[:70]}", style="dim"))
+                    console.print(Text("  Spawning sub-agents…", style="dim italic"))
 
-                    def _on_progress(task):  # noqa: ANN001, ANN201
-                        icon = "✓" if task.status.value == "completed" else "✗"
+                    def _on_progress(report):  # noqa: ANN001, ANN201
+                        icon = "✓" if report.status == "completed" else "✗"
+                        style = "green" if report.status == "completed" else "red"
                         console.print(
-                            Text(f"    {icon} {task.description[:60]}", style="green" if task.status.value == "completed" else "red")
+                            Text(f"    {icon} [{report.task_id}] {report.summary[:50] or report.error[:50]}", style=style)
                         )
 
-                    await orch.execute_plan(on_progress=_on_progress)
-                    status = orch.status()
+                    reports = await session.delegate_tasks(tasks, on_progress=_on_progress)
+                    completed = sum(1 for r in reports if r.status == "completed")
+                    failed = sum(1 for r in reports if r.status in ("failed", "timeout"))
                     console.print(
                         Text(
-                            f"  Done: {status['completed']}/{status['total']} completed, "
-                            f"{status['failed']} failed",
-                            style="green" if status["failed"] == 0 else "yellow",
+                            f"  Done: {completed}/{len(reports)} completed, {failed} failed",
+                            style="green" if failed == 0 else "yellow",
                         )
                     )
+                    # Merge results back into main worktree.
+                    if completed > 0:
+                        console.print(Text("  Merging worktrees…", style="dim italic"))
+                        merge_result = session.merge_subagent_results(reports)
+                        if merge_result.success:
+                            console.print(
+                                Text(f"  ✓ Merged {len(merge_result.merged)} task(s)", style="green")
+                            )
+                        else:
+                            console.print(
+                                Text(f"  ⚠ Conflicts: {merge_result.conflicts}", style="yellow")
+                            )
             elif text == "/lessons" or text.startswith("/lessons "):
                 store = session.lesson_store
                 subcmd = text.partition(" ")[2].strip()

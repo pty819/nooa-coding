@@ -26,7 +26,7 @@ from .hooks import HookRunner, load_hooks_config
 from .learning import LessonExtractor, LessonStore
 from .llm import build_llm
 from .mcp import MCPServerStatus
-from .multi_agent import Orchestrator
+from .multi_agent import Coordinator, MergeResult, TaskPackage, WorkerReport, merge_worktrees
 from .policy import ApprovalManager, PermissionPolicy, PolicyShellTools
 from .workspace import Checkpoint, DiffResult, WorkspaceInfo, WorkspaceManager
 
@@ -104,7 +104,8 @@ class AgentSession:
         self._closed = False
         self._token_usage = TokenUsage()
         self._goal: GoalState | None = None
-        self._orchestrator: Orchestrator | None = None
+        self._coordinator: Coordinator | None = None
+        self._is_sub_agent = False
         self._lesson_store: LessonStore | None = None
         self._lesson_extractor: LessonExtractor | None = None
 
@@ -333,11 +334,60 @@ class AgentSession:
     # ─── Goal mode ───────────────────────────────────────────────────────────
 
     @property
-    def orchestrator(self) -> Orchestrator:
-        """Lazy-initialized multi-agent orchestrator for this session."""
-        if self._orchestrator is None:
-            self._orchestrator = Orchestrator(self, hook_runner=self._hook_runner)
-        return self._orchestrator
+    def coordinator(self) -> Coordinator:
+        """Lazy-initialized sub-agent coordinator for this session.
+
+        Only the main (non-sub-agent) session can access this.
+        Sub-agents are forbidden from spawning further sub-agents.
+        """
+        if self._is_sub_agent:
+            raise PermissionError("Sub-agents cannot spawn further sub-agents")
+        if self._coordinator is None:
+            self._coordinator = Coordinator(
+                self.manager, self, hook_runner=self._hook_runner
+            )
+        return self._coordinator
+
+    async def delegate_tasks(
+        self, tasks: list[TaskPackage], *, on_progress: Any = None
+    ) -> list[WorkerReport]:
+        """Delegate tasks to isolated sub-agents and wait for results.
+
+        This is the main entry point for multi-agent delegation.
+        The main agent constructs TaskPackages, calls this method,
+        and receives structured WorkerReports back.
+        """
+        coordinator = self.coordinator
+        handles = coordinator.spawn(tasks)
+        self._emit(
+            "session",
+            "subagents_spawned",
+            {"count": len(handles), "tasks": [t.task_id for t in tasks]},
+        )
+        reports = await coordinator.wait_all(handles, on_progress=on_progress)
+        self._emit(
+            "session",
+            "subagents_completed",
+            {
+                "completed": sum(1 for r in reports if r.status == "completed"),
+                "failed": sum(1 for r in reports if r.status in ("failed", "timeout")),
+            },
+        )
+        return reports
+
+    def merge_subagent_results(self, reports: list[WorkerReport]) -> MergeResult:
+        """Merge sub-agent worktree commits into this session's worktree."""
+        result = merge_worktrees(self.workspace, reports)
+        self._emit(
+            "session",
+            "worktrees_merged",
+            {
+                "merged": result.merged,
+                "conflicts": result.conflicts,
+                "success": result.success,
+            },
+        )
+        return result
 
     @property
     def lesson_store(self) -> LessonStore:
