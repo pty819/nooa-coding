@@ -1,6 +1,9 @@
 ---
 name: use-tools
 description: Reference guide for the agent's built-in capabilities and how to call them correctly.
+trigger: Agent needs to discover available tools, user asks "what can you do", "how do I use", or references self.shell/self.repo/self.todo APIs
+route: use-tools
+output-contract: Correct tool invocation using policy-controlled self.* methods; no direct filesystem or subprocess access
 ---
 
 # Using Your Built-in Tools

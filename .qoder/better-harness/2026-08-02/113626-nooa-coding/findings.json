@@ -1,0 +1,152 @@
+{
+  "summary": {
+    "projectName": "NOOA Coding Agent",
+    "locale": "zh-CN",
+    "modelId": "agent-work-loop-v4",
+    "reportContractVersion": 25,
+    "overview": "项目具备清晰的策略分层和测试覆盖基础，但核心边界缺乏机械执行、交付管道缺少自动化验证、高频变更集中在超大文件且无配置化的可复用资产。",
+    "aiAgentPractice": {
+      "inspectedSurfaces": [
+        "Rules",
+        "Custom Agents"
+      ],
+      "coverageRows": [
+        {
+          "surface": "Rules",
+          "scopes": [
+            "Project"
+          ],
+          "count": 1,
+          "paths": [
+            "AGENTS.md"
+          ]
+        },
+        {
+          "surface": "Custom Agents",
+          "scopes": [
+            "Project"
+          ],
+          "count": 0
+        },
+        {
+          "surface": "Skills",
+          "scopes": [
+            "Project"
+          ],
+          "count": 5,
+          "paths": [
+            "src/nooa_coding/skills/create-pr/SKILL.md",
+            "src/nooa_coding/skills/explain-error/SKILL.md",
+            "src/nooa_coding/skills/refactor/SKILL.md",
+            "src/nooa_coding/skills/run-tests/SKILL.md",
+            "src/nooa_coding/skills/use-tools/SKILL.md"
+          ]
+        }
+      ]
+    },
+    "assignmentSummaries": [],
+    "dimensions": [
+      {
+        "id": "task-understanding",
+        "label": "任务理解",
+        "score": 59,
+        "summary": "AGENTS.md 声明了行为约束和验收边界，但无会话证据证实其在实际任务中被路由和遵循。",
+        "findingRefs": [
+          "core-boundary-unenforced"
+        ]
+      },
+      {
+        "id": "controlled-execution",
+        "label": "可控执行",
+        "score": 59,
+        "summary": "工作区清单和 worktree 隔离机制已配置，但无运行时证据证实其被强制执行。",
+        "findingRefs": [
+          "high-churn-monolithic-files"
+        ]
+      },
+      {
+        "id": "change-validation",
+        "label": "改动验证",
+        "score": 59,
+        "summary": "16 个测试文件覆盖了主要模块，但无 CI 或 pre-commit hook 确保检查在每次变更前被执行。",
+        "findingRefs": [
+          "delivery-pipeline-unverified"
+        ]
+      },
+      {
+        "id": "reliable-delivery",
+        "label": "可靠交付",
+        "score": 59,
+        "summary": "无交付管道配置或自动化执行证据，合并接受路径和回滚机制不可观测。",
+        "findingRefs": []
+      },
+      {
+        "id": "learning-capture",
+        "label": "经验沉淀",
+        "score": 35,
+        "summary": "无可比后续结果验证可复用改进；零配置化 Skills/Memory 且无会话证据支撑学习循环。",
+        "findingRefs": [
+          "skill-coverage-gap"
+        ]
+      }
+    ]
+  },
+  "findings": [
+    {
+      "id": "skill-coverage-gap",
+      "title": "项目包含 5 个已实现的 SKILL.md 文件但未注册为可配置 Skills",
+      "severity": "Medium",
+      "reason": "src/nooa_coding/skills/ 下存在 create-pr、explain-error、refactor、run-tests、use-tools 五个过程性知识资产，每个均包含 procedure 和 output 定义，但资产清单报告 0 个已配置 Skills。代理无法通过内置路由发现或调用这些能力，重复性操作流程只能依赖代理临时推断。",
+      "expectedOutput": [
+        "5 个 SKILL.md 文件出现在已配置 Skills 清单中，具有可路由的触发名称。"
+      ],
+      "expectedArtifact": "Skill 注册配置",
+      "aiFixPrompt": "/better-harness fix this issue\n\n将 src/nooa_coding/skills/ 下的 5 个 SKILL.md 文件注册为可配置的 Agent Skills，确保每个 Skill 具有明确的触发条件、路由名称和输出契约。\n\n## 验证\n\n- 运行资产扫描确认 5 个 Skills 出现在已配置 Skills 清单中\n- 确认每个 Skill 的触发描述与项目工作流匹配",
+      "dimensionRefs": [
+        "learning-capture"
+      ]
+    },
+    {
+      "id": "core-boundary-unenforced",
+      "title": "核心代码边界缺乏机械执行机制",
+      "severity": "Medium",
+      "reason": "AGENTS.md 明确声明「不得修补或导入 NOOA 内部」和「不得从 prompt 绕过审批策略」，但无文件级 include/exclude 规则或自动化检查。扫描器将 coreCodeRules 标记为 missing。代理在修改 session.py 或 policy.py 时，边界违规只能在人工审查时发现，无自动机制阻止越界变更。",
+      "expectedOutput": [
+        "核心模块的边界约束可被自动化检查，AGENTS.md 行为规则具有可验证的执行路径。"
+      ],
+      "expectedArtifact": "核心边界配置",
+      "aiFixPrompt": "/better-harness fix this issue\n\n为核心模块（session.py、policy.py、agent.py）添加边界约束，使 AGENTS.md 中的行为规则具有可验证的执行路径。\n\n## 验证\n\n- 确认核心边界规则可被自动化工具检查\n- 确认 AGENTS.md 约束与实际代码结构一致",
+      "dimensionRefs": [
+        "task-understanding"
+      ]
+    },
+    {
+      "id": "delivery-pipeline-unverified",
+      "title": "质量门禁缺少自动化执行证据",
+      "severity": "Low",
+      "reason": "项目配置了 ruff（lint）、pyright（类型检查）和 pytest（测试），但仓库中无 CI 配置文件（无 .github/workflows、Makefile 或 tox.ini）、无 pre-commit hook。质量门禁仅存在于声明层面，无法确认 lint/type/test 是否在每次变更前被强制执行。core-change-watch 将「tests passed」标记为 UNVERIFIED。",
+      "expectedOutput": [
+        "每次提交或合并前自动执行 ruff、pyright 和 pytest，质量门禁从声明层面提升为强制执行。"
+      ],
+      "expectedArtifact": "CI 配置或 pre-commit hook",
+      "aiFixPrompt": "/better-harness fix this issue\n\n为项目添加 CI 配置或 pre-commit hook，确保 ruff、pyright 和 pytest 在每次提交或合并前自动执行。\n\n## 验证\n\n- 运行 CI 检查命令或 pre-commit hook 确认质量门禁可自动执行\n- 确认 lint、类型检查和测试均在门禁范围内",
+      "dimensionRefs": [
+        "change-validation"
+      ]
+    },
+    {
+      "id": "high-churn-monolithic-files",
+      "title": "高频变更集中在超大职责文件",
+      "severity": "Low",
+      "reason": "cli.py（7 次提交，1298 churn）和 session.py（9 次提交，1124 churn）在 5 天内是变更最密集的源文件，各自承担入口交互、会话编排、持久化、恢复等多重职责。每次变更的上下文需求高，代理容易遗漏相关副作用或依赖链路。",
+      "expectedOutput": [
+        "高频变更文件被拆分为职责更单一的模块，每次变更的上下文需求降低。"
+      ],
+      "expectedArtifact": "模块拆分方案",
+      "aiFixPrompt": "/better-harness fix this issue\n\n审查 cli.py 和 session.py 的职责边界，识别可拆分的独立关注点，降低单次变更的认知负荷。\n\n## 验证\n\n- 确认拆分后的模块各自具有单一职责\n- 确认现有测试在拆分后仍然通过",
+      "dimensionRefs": [
+        "controlled-execution"
+      ]
+    }
+  ]
+}

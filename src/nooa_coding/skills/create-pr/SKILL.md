@@ -1,6 +1,9 @@
 ---
 name: create-pr
 description: Prepare the worktree for submission — commit, push, and generate a PR description.
+trigger: User requests a pull request, says "/pr", "create PR", "submit", or "push for review"
+route: create-pr
+output-contract: Structured PR description with Summary, Changes, Testing, and Breaking Changes sections; push confirmation or blocked status
 ---
 
 # Creating a Pull Request

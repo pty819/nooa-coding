@@ -1,6 +1,9 @@
 ---
 name: run-tests
 description: Run project test suites, interpret failures, and iterate until green.
+trigger: User says "run tests", "test this", "check if tests pass", "fix failing tests", or requests test verification
+route: run-tests
+output-contract: Final test count and pass/fail status; failure diagnosis with file paths; lint results
 ---
 
 # Running Tests

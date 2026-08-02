@@ -13,6 +13,7 @@ from typing import Protocol
 import click
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import Completer, Completion
+from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.patch_stdout import patch_stdout
 from rich.console import Console
@@ -212,7 +213,7 @@ async def _run_single_turn(
     control_task: asyncio.Task[str] | None = None
     if allow_controls:
         control_task = asyncio.create_task(
-            prompt.prompt_async("\001\033[2m\002  ⋮ /cancel · /approve · /deny\001\033[0m\002 > ")
+            prompt.prompt_async(HTML("<dim>  ⋮ /cancel · /approve · /deny</dim> > "))
         )
     pending_followups: list[str] = []
     try:
@@ -274,7 +275,7 @@ async def _run_single_turn(
                     console.print(Text("Follow-up queued for the next turn.", style="dim"))
                 if not turn.done():
                     control_task = asyncio.create_task(
-                        prompt.prompt_async("\001\033[2m\002  ⋮ /cancel · /approve · /deny\001\033[0m\002 > ")
+                        prompt.prompt_async(HTML("<dim>  ⋮ /cancel · /approve · /deny</dim> > "))
                     )
         try:
             result = await turn
@@ -402,19 +403,19 @@ async def _interactive(manager: AgentSessionManager, session: AgentSession) -> N
     )
     renderer.banner(session.session_id, session.current_model, session.workspace)
 
-    def _prompt_msg() -> str:
+    def _prompt_msg() -> HTML:
         model_short = session.current_model.split("/")[-1][:20]
-        return f"\001\033[1;34m\002{model_short}\001\033[0m\002 \001\033[2m\002❯\001\033[0m\002 "
+        return HTML(f"<b><ansiblue>{model_short}</ansiblue></b> <dim>❯</dim> ")
 
-    def _bottom_toolbar() -> str:
+    def _bottom_toolbar() -> HTML:
         goal_hint = ""
         if session.goal and session.goal.status == "active":
-            goal_hint = f" | \001\033[36m\002◎ goal {session.goal.turns_used}/{session.goal.turn_budget}\001\033[0m\002"
-        return (
-            " \001\033[2m\002Ctrl+J\001\033[0m\002 newline"
-            " · \001\033[2m\002Ctrl+G\001\033[0m\002 editor"
-            " · \001\033[2m\002Tab\001\033[0m\002 complete"
-            " · \001\033[2m\002/help\001\033[0m\002 commands"
+            goal_hint = f" | <ansicyan>◎ goal {session.goal.turns_used}/{session.goal.turn_budget}</ansicyan>"
+        return HTML(
+            " <dim>Ctrl+J</dim> newline"
+            " · <dim>Ctrl+G</dim> editor"
+            " · <dim>Tab</dim> complete"
+            " · <dim>/help</dim> commands"
             f"{goal_hint}"
         )
 

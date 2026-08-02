@@ -1,6 +1,9 @@
 ---
 name: explain-error
 description: Diagnose an error message or traceback, find the root cause, and explain it clearly.
+trigger: User pastes a traceback, says "explain error", "why does this fail", "diagnose", or asks about an exception
+route: explain-error
+output-contract: Structured diagnosis with Error, Location, Root Cause, and Fix sections; no code modifications
 ---
 
 # Explaining Errors

@@ -1,6 +1,9 @@
 ---
 name: refactor
 description: Systematic approach to refactoring code while preserving behaviour.
+trigger: User says "refactor", "rename", "extract", "restructure", "clean up", or requests code reorganization without behaviour change
+route: refactor
+output-contract: Refactored code passing full test suite and lint; list of changed files; blocked status if tests are insufficient
 ---
 
 # Refactoring Code
