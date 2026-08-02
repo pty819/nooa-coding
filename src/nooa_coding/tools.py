@@ -19,6 +19,13 @@ class CodeSearch(Skill):
         self._root = Path(root).resolve()
         super().__init__()
 
+    def _contained(self, path: str) -> Path | None:
+        """Resolve *path* relative to root; return None if it escapes the worktree."""
+        target = (self._root / path).resolve()
+        if target == self._root or str(target).startswith(str(self._root) + "/"):
+            return target
+        return None
+
     async def search(
         self,
         query: Annotated[str, spec(description="Regex or literal pattern to search for")],
@@ -73,7 +80,9 @@ class CodeSearch(Skill):
         end: Annotated[int, spec(description="End line (inclusive)")],
     ) -> str:
         """Read a specific line range from a file for context expansion."""
-        target = self._root / path
+        target = self._contained(path)
+        if target is None:
+            return f"Path escapes worktree: {path}"
         if not target.is_file():
             return f"File not found: {path}"
         lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -93,7 +102,9 @@ class CodeSearch(Skill):
         path: Annotated[str, spec(description="File path relative to the worktree")],
     ) -> str:
         """Show the symbol outline of a file (classes, functions, methods)."""
-        target = self._root / path
+        target = self._contained(path)
+        if target is None:
+            return f"Path escapes worktree: {path}"
         if not target.is_file():
             return f"File not found: {path}"
         if target.suffix == ".py":
@@ -156,7 +167,9 @@ class LSPTools(Skill):
         character: Annotated[int, spec(description="1-based column number")],
     ) -> str:
         """Find definitions of the symbol at a position using ctags/ripgrep fallback."""
-        target = self._root / path
+        target = (self._root / path).resolve()
+        if not str(target).startswith(str(self._root) + "/"):
+            return f"Path escapes worktree: {path}"
         if not target.is_file():
             return f"File not found: {path}"
         # Read the symbol at the given position.

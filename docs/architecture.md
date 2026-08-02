@@ -3,15 +3,16 @@
 ## Dependency boundary
 
 `nooa-coding` is an application repository. It consumes public APIs from three
-packages pinned to the same reviewed upstream commit:
+packages pinned to the same PyPI release:
 
 - `nooa` for Agent, CodeAct, events, snapshots, compaction, and model clients;
 - `nooa-cli` for repository navigation;
 - `nooa-memory` for project-scoped long-term memory.
 
 The application owns configuration layering, session lifecycle, workspaces,
-approvals, traces, failover, and terminal interaction. It does not patch NOOA or
-import runtime-private symbols.
+approvals, traces, failover, and terminal interaction. It does not patch NOOA.
+Some internal attributes are accessed for host-level orchestration (e.g.
+`_policy`, `_mcp`); these are treated as stable integration points.
 
 ## Session lifecycle
 

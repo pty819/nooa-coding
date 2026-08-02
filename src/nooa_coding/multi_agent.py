@@ -304,15 +304,25 @@ class Coordinator:
                     session.prompt(prompt),
                     timeout=task.timeout_seconds or self._settings.timeout_seconds,
                 )
-                # Commit changes in the sub-agent worktree.
-                commit_sha = self._commit_changes(session, task)
+                # Map the actual result status to task status.
+                if result.status in ("completed", "answered", "inspected"):
+                    task_status = TaskStatus.COMPLETED
+                else:
+                    task_status = TaskStatus.FAILED
+                # Only commit and allow merge for genuinely completed work.
+                commit_sha = (
+                    self._commit_changes(session, task)
+                    if task_status == TaskStatus.COMPLETED
+                    else None
+                )
                 # Build diff info.
                 diff_info = self._collect_diff(session)
                 completed = datetime.now(UTC)
                 report = WorkerReport(
                     task_id=task.task_id,
-                    status=TaskStatus.COMPLETED,
+                    status=task_status,
                     summary=result.summary,
+                    error=result.summary if task_status == TaskStatus.FAILED else "",
                     files_changed=diff_info["files"],
                     diff_stat=diff_info["stat"],
                     tests_passed=None,

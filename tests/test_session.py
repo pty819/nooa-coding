@@ -399,8 +399,12 @@ async def test_permission_switch_updates_policy(git_repo: Path, settings) -> Non
         assert policy.settings.file_write == "allow"
         assert policy.settings.shell == "allow"
 
+        session.switch_permissions("yolo")
+        assert policy.settings.file_write == "allow"
+        assert policy.settings.shell == "allow"
+
         with pytest.raises(ValueError, match="unknown permission mode"):
-            session.switch_permissions("yolo")
+            session.switch_permissions("invalid")
     finally:
         await session.close()
 

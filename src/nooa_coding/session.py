@@ -102,6 +102,7 @@ class AgentSession:
         self._run_lock = asyncio.Lock()
         self._active_task: asyncio.Task[CodingTaskResult] | None = None
         self._closed = False
+        self._session_start_fired = False
         self._token_usage = TokenUsage()
         self._goal: GoalState | None = None
         self._coordinator: Coordinator | None = None
@@ -191,9 +192,9 @@ class AgentSession:
         raise ValueError(f"unknown model '{model_name}'. Available: {available}")
 
     def switch_permissions(self, mode: str) -> None:
-        """Switch permission mode at runtime: 'allow', 'ask', or 'default'."""
+        """Switch permission mode at runtime: 'yolo', 'allow', 'ask', or 'default'."""
         policy = self.agent.shell._policy  # noqa: SLF001
-        if mode == "allow":
+        if mode in ("allow", "yolo"):
             policy.settings = self.settings.permissions.model_copy(
                 update={"file_read": "allow", "file_write": "allow", "shell": "allow"}
             )
@@ -204,7 +205,7 @@ class AgentSession:
         elif mode == "default":
             policy.settings = self.settings.permissions
         else:
-            raise ValueError(f"unknown permission mode '{mode}'. Use: allow, ask, default")
+            raise ValueError(f"unknown permission mode '{mode}'. Use: yolo, ask, default")
         self._emit("session", "permissions_changed", {"mode": mode})
 
     async def review(self) -> str:
@@ -269,8 +270,10 @@ class AgentSession:
         return response.content or "No suggestion produced."
 
     async def stream_direct(self, prompt: str) -> AsyncIterator[str]:
-        """Stream a direct LLM response token-by-token using litellm."""
+        """Stream a direct LLM response token-by-token via the active failover client."""
         import litellm
+
+        from .system_prompt import render_runtime_system_context
 
         active = getattr(self.llm, "active", self.llm)
         model = str(getattr(active, "model", getattr(self.llm, "model", "")))
@@ -284,10 +287,15 @@ class AgentSession:
         if api_key:
             kwargs["api_key"] = api_key
 
-        response = await litellm.acompletion(
-            messages=[{"role": "user", "content": prompt}],
-            **kwargs,
+        system_ctx = render_runtime_system_context(
+            active_model=model, worktree=self.workspace
         )
+        messages = [
+            {"role": "system", "content": system_ctx},
+            {"role": "user", "content": prompt},
+        ]
+
+        response = await litellm.acompletion(messages=messages, **kwargs)
         async for chunk in response:
             delta = chunk.choices[0].delta if chunk.choices else None
             if delta and delta.content:
@@ -407,6 +415,11 @@ class AgentSession:
         if self._lesson_extractor is None:
             self._lesson_extractor = LessonExtractor(self.lesson_store, self.llm)
         return self._lesson_extractor
+
+    @property
+    def skill_manifest(self):
+        """Public access to the skill routing manifest."""
+        return getattr(self.agent, "_skill_manifest", None)
 
     async def learn_from_failure(
         self, task: str, error: str, evidence: str = ""
@@ -654,6 +667,9 @@ class AgentSession:
             raise ValueError("prompt must be non-empty")
         if self._closed:
             raise RuntimeError("session is closed")
+        if not self._session_start_fired:
+            self._session_start_fired = True
+            await self._fire_session_start()
         async with self._run_lock:
             if self._active_task is not None:
                 raise RuntimeError("session already has an active turn")

@@ -1,8 +1,9 @@
 # NOOA Coding Agent
 
 An independent, single-user coding-agent product built on the public NVIDIA
-NOOA runtime. The application pins NOOA to a reviewed upstream commit, so an
-upstream fetch or checkout cannot silently change agent behavior.
+NOOA runtime. The application consumes NOOA from PyPI with a minimum-version
+constraint (`>=0.0.8`); `uv.lock` pins the resolved version for reproducible
+installs.
 
 ## What it provides
 
@@ -120,12 +121,15 @@ See [architecture.md](docs/architecture.md) for lifecycle and persistence detail
 
 ## Dependency boundary
 
-`pyproject.toml` and `uv.lock` pin `nooa`, `nooa-cli`, and `nooa-memory` to an
-exact upstream commit. To upgrade:
+`pyproject.toml` declares minimum-version constraints (`>=0.0.8`) for `nooa`,
+`nooa-cli`, and `nooa-memory` from PyPI. `uv.lock` pins the resolved versions.
+To upgrade:
 
-1. update all three `rev` values together;
-2. run `uv lock --upgrade-package nooa --upgrade-package nooa-cli --upgrade-package nooa-memory`;
-3. run the complete test and type-check suite;
-4. inspect the dependency diff before committing the new lockfile.
+1. run `uv lock --upgrade-package nooa --upgrade-package nooa-cli --upgrade-package nooa-memory`;
+2. run the complete test and type-check suite;
+3. inspect the dependency diff before committing the new lockfile.
 
 No code in this repository should require modifications to a NOOA checkout.
+Some internal NOOA attributes (e.g. `_policy`, `_mcp`) are accessed for
+host-level orchestration; these are treated as stable integration points
+rather than public API.

@@ -135,7 +135,7 @@ class TerminalRenderer:
             ("/status", "Show session status panel"),
             ("/clear", "Clear conversation history"),
             ("/model [NAME]", "Show or switch the active model"),
-            ("/permissions [MODE]", "Show or switch permission mode (allow/ask/default)"),
+            ("/permissions [MODE]", "Show or switch permission mode (yolo/ask/default)"),
             ("/plan TASK", "Generate an implementation plan without executing"),
             ("/suggest TASK", "Generate a diff suggestion without applying"),
             ("/goal OBJECTIVE", "Set a goal; agent auto-continues until achieved"),
@@ -211,12 +211,14 @@ class TerminalRenderer:
             resource = clean_terminal_text(event.data.get("resource", ""))
             body = Group(
                 Text(f"  {kind}: ", style="bold") + Text(resource),
-                Text(f"  /approve {request_id}", style="green")
-                + Text(" or ", style="dim")
-                + Text(f"/deny {request_id}", style="red"),
+                Text("  y", style="bold green")
+                + Text(" approve · ", style="dim")
+                + Text("n", style="bold red")
+                + Text(" deny · ", style="dim")
+                + Text(f"/approve {request_id}", style="dim"),
             )
             self.console.print(
-                Panel(body, title=f"⚠ Approval · {request_id}", border_style="yellow")
+                Panel(body, title="⚠ Approval", border_style="yellow")
             )
             return
         if event.name == "approval_resolved":

@@ -255,6 +255,8 @@ class CodingAgent(MemoryToolsMixin, InteractiveAgent):
 
     def reload_project_resources(self) -> str:
         """Reload AGENTS.md content; new skills are discovered and activated."""
+        from .resources import build_skill_manifest
+
         instructions = load_agents_context(self._repo_root, self._settings.resources)
         if instructions:
             self.context_manager["project_instructions"] = Context(instructions, prefix=True)
@@ -264,6 +266,8 @@ class CodingAgent(MemoryToolsMixin, InteractiveAgent):
             directories.append(path if path.is_absolute() else self._repo_root / path)
         self.skills.discover_skills_dirs(directories)
         self.skills.activate(list(self._settings.resources.activate_skills))
+        # Rebuild the skill manifest so routing metadata stays current.
+        self._skill_manifest = build_skill_manifest(directories)  # noqa: SLF001
         return f"Reloaded project instructions and {len(self.skills.activated())} active skills."
 
     @hidden
@@ -486,6 +490,7 @@ class CodingAgent(MemoryToolsMixin, InteractiveAgent):
                 model=self._current_model(),
             )
             self.last_result = result
+            self._plugins.notify_turn_end(result)
             return result
 
         mode = await self._route_request(task)
@@ -501,6 +506,7 @@ class CodingAgent(MemoryToolsMixin, InteractiveAgent):
                 model=self._current_model(),
             )
             self.last_result = result
+            self._plugins.notify_turn_end(result)
             return result
 
         if not self.todo.list_todos():
@@ -517,6 +523,7 @@ class CodingAgent(MemoryToolsMixin, InteractiveAgent):
                 model=self._current_model(),
             )
             self.last_result = result
+            self._plugins.notify_turn_end(result)
             return result
 
         state_before = await self._worktree_state()

@@ -176,7 +176,11 @@ class PermissionPolicy:
                 fnmatch.fnmatchcase(normalized, pattern) for pattern in self.settings.allow_shell
             )
         ):
-            return "allow"
+            # Even if the allowlist matches, reject commands with known mutating flags.
+            if self.read_only_shell_allowed(normalized):
+                return "allow"
+            # Allowlist matched but the command has potentially dangerous flags;
+            # fall through to the configured default (usually "ask").
         return self.settings.shell
 
     async def shell(self, command: str) -> None:

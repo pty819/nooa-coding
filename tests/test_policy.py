@@ -111,3 +111,54 @@ async def test_shell_cwd_is_restored_to_worktree(tmp_path: Path) -> None:
             await shell.write_file("../outside.txt", "no")
     finally:
         await shell.close()
+
+
+@pytest.mark.asyncio
+async def test_single_pending_approval_resolvable_without_id(tmp_path: Path) -> None:
+    """When only one approval is pending, resolving pending()[0] works (no ID needed in UI)."""
+    approvals = ApprovalManager(lambda *_: None)
+    policy = PermissionPolicy(PermissionSettings(shell="ask"), approvals)
+    task = asyncio.create_task(policy.shell("echo hi"))
+    await asyncio.sleep(0)
+
+    pending = approvals.pending()
+    assert len(pending) == 1
+    # Simulate bare /approve: resolve the single pending item by its ID.
+    approvals.decide(pending[0].request_id, allow=True)
+    await task  # Should not raise.
+
+
+@pytest.mark.asyncio
+async def test_yolo_mode_allows_all_except_deny_patterns(tmp_path: Path) -> None:
+    """Yolo mode (all allow) still respects deny_shell patterns."""
+    approvals = ApprovalManager(lambda *_: None)
+    settings = PermissionSettings(
+        file_read="allow", file_write="allow", shell="allow"
+    )
+    policy = PermissionPolicy(settings, approvals)
+    shell = PolicyShellTools(tmp_path, policy, LimitSettings(), lambda *_: None)
+    try:
+        # Normal commands pass without approval.
+        result = await shell.run("echo yolo")
+        assert result.success
+        assert not approvals.pending()
+        # Deny patterns still blocked.
+        with pytest.raises(PermissionError, match="denies"):
+            await shell.run("rm -rf /")
+    finally:
+        await shell.close()
+
+
+def test_allowlist_does_not_auto_allow_mutating_flags() -> None:
+    """find -exec and similar must NOT be auto-allowed by the allowlist."""
+    approvals = ApprovalManager(lambda *_: None)
+    policy = PermissionPolicy(PermissionSettings(shell="ask"), approvals)
+    # find . -exec matches 'find *' glob but has mutating flag.
+    assert policy.shell_mode("find . -exec touch marker {} +") == "ask"
+    assert policy.shell_mode("find . -delete") == "ask"
+    # Safe find commands are still auto-allowed.
+    assert policy.shell_mode("find . -name '*.py'") == "allow"
+    # rg with --pre is not auto-allowed.
+    assert policy.shell_mode("rg --pre cat pattern") == "ask"
+    # Normal rg is fine.
+    assert policy.shell_mode("rg pattern") == "allow"

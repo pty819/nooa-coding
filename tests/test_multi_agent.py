@@ -303,6 +303,7 @@ class TestCoordinatorExecution:
 
         mock_result = MagicMock()
         mock_result.summary = "Tests written successfully"
+        mock_result.status = "completed"
         sub_session.prompt = AsyncMock(return_value=mock_result)
 
         with patch.object(coordinator, "_commit_changes", return_value="abc123"):

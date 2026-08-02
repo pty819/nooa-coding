@@ -143,3 +143,29 @@ class TestLSPTools:
         # "hello" starts at col 5 in "def hello():"
         result = await lsp.definitions("src/main.py", 1, 5)
         assert "hello" in result
+
+
+class TestWorktreeContainment:
+    @pytest.mark.asyncio
+    async def test_read_range_blocks_path_traversal(self, code_root):
+        cs = CodeSearch(code_root)
+        result = await cs.read_range("../../etc/passwd", 1, 5)
+        assert "escapes worktree" in result
+
+    @pytest.mark.asyncio
+    async def test_outline_blocks_path_traversal(self, code_root):
+        cs = CodeSearch(code_root)
+        result = await cs.outline("../../../etc/passwd")
+        assert "escapes worktree" in result
+
+    @pytest.mark.asyncio
+    async def test_definitions_blocks_path_traversal(self, code_root):
+        lsp = LSPTools(code_root)
+        result = await lsp.definitions("../../etc/passwd", 1, 1)
+        assert "escapes worktree" in result
+
+    @pytest.mark.asyncio
+    async def test_read_range_allows_valid_path(self, code_root):
+        cs = CodeSearch(code_root)
+        result = await cs.read_range("src/main.py", 1, 2)
+        assert "hello" in result

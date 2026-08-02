@@ -150,10 +150,14 @@ class AsyncPrompt(Protocol):
 
 def _expand_at_mentions(text: str, workspace: Path) -> str:
     """Expand @file references by inlining file content."""
+    resolved_root = workspace.resolve()
 
     def _replace(match: re.Match) -> str:  # noqa: ANN001
         rel_path = match.group(1)
-        target = workspace / rel_path
+        target = (workspace / rel_path).resolve()
+        # Containment check: reject paths escaping the worktree.
+        if not str(target).startswith(str(resolved_root) + "/") and target != resolved_root:
+            return match.group(0)
         if target.is_file():
             try:
                 content = target.read_text(encoding="utf-8")
@@ -213,7 +217,7 @@ async def _run_single_turn(
     control_task: asyncio.Task[str] | None = None
     if allow_controls:
         control_task = asyncio.create_task(
-            prompt.prompt_async(HTML("<dim>  ⋮ /cancel · /approve · /deny</dim> > "))
+            prompt.prompt_async(HTML("<dim>  ⋮ y/n · /cancel</dim> > "))
         )
     pending_followups: list[str] = []
     try:
@@ -262,7 +266,20 @@ async def _run_single_turn(
                 elif command.startswith("/deny "):
                     _resolve_approval(session, command.split(maxsplit=1)[1], allow=False)
                 elif command in {"/approve", "/deny"}:
-                    console.print(Text(f"Usage: {command} REQUEST_ID", style="yellow"))
+                    pending = session.approvals.pending()
+                    if len(pending) == 1:
+                        _resolve_approval(
+                            session, pending[0].request_id, allow=(command == "/approve")
+                        )
+                    elif not pending:
+                        console.print(Text("No pending approvals.", style="dim"))
+                    else:
+                        console.print(
+                            Text(
+                                f"{len(pending)} pending. Use /approve ID or /deny ID.",
+                                style="yellow",
+                            )
+                        )
                 elif command.startswith("/"):
                     console.print(
                         Text(
@@ -275,7 +292,7 @@ async def _run_single_turn(
                     console.print(Text("Follow-up queued for the next turn.", style="dim"))
                 if not turn.done():
                     control_task = asyncio.create_task(
-                        prompt.prompt_async(HTML("<dim>  ⋮ /cancel · /approve · /deny</dim> > "))
+                        prompt.prompt_async(HTML("<dim>  ⋮ y/n · /cancel</dim> > "))
                     )
         try:
             result = await turn
@@ -462,6 +479,20 @@ async def _interactive(manager: AgentSessionManager, session: AgentSession) -> N
                 _resolve_approval(session, text.split(maxsplit=1)[1], allow=True)
             elif text.startswith("/deny "):
                 _resolve_approval(session, text.split(maxsplit=1)[1], allow=False)
+            elif text in {"/approve", "/deny", "y", "yes", "n", "no"}:
+                pending = session.approvals.pending()
+                allow = text in {"/approve", "y", "yes"}
+                if len(pending) == 1:
+                    _resolve_approval(session, pending[0].request_id, allow=allow)
+                elif not pending:
+                    console.print(Text("No pending approvals.", style="dim"))
+                else:
+                    console.print(
+                        Text(
+                            f"{len(pending)} pending. Use /approve ID or /deny ID.",
+                            style="yellow",
+                        )
+                    )
             elif text.startswith("/replay"):
                 raw = text.partition(" ")[2].strip()
                 count = int(raw) if raw else 20
@@ -597,14 +628,14 @@ async def _interactive(manager: AgentSessionManager, session: AgentSession) -> N
                         v.model_dump() for v in (result.verifications if result else [])
                     ],
                     token_usage={
-                        "prompt_tokens": usage.prompt_tokens,
-                        "completion_tokens": usage.completion_tokens,
+                        "prompt_tokens": usage.total_prompt_tokens,
+                        "completion_tokens": usage.total_completion_tokens,
                         "total_tokens": usage.total_tokens,
                         "cost_usd": f"{usage.total_cost_usd:.4f}",
                     },
                     events_count=session._sequence,
                 )
-                output_dir = Path.cwd() / "nooa-reports"
+                output_dir = session.workspace / "nooa-reports"
                 written = write_report(report, output_dir, formats=formats)
                 for path in written:
                     console.print(Text(f"✓ {path}", style="green"))
@@ -649,7 +680,7 @@ async def _interactive(manager: AgentSessionManager, session: AgentSession) -> N
                         )
                     )
                     console.print(
-                        Text("Use /permissions allow|ask|default to switch.", style="dim")
+                        Text("Use /permissions yolo|ask|default to switch.", style="dim")
                     )
                 else:
                     try:
@@ -660,7 +691,7 @@ async def _interactive(manager: AgentSessionManager, session: AgentSession) -> N
                     except ValueError as exc:
                         console.print(Text(str(exc), style="yellow"))
             elif text == "/export":
-                export_path = Path(f"nooa-session-{session.session_id}.jsonl")
+                export_path = session.workspace / f"nooa-session-{session.session_id}.jsonl"
                 events = session.replay()
                 with export_path.open("w", encoding="utf-8") as f:
                     for ev in events:
