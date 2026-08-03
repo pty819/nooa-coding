@@ -92,6 +92,48 @@ async def test_runtime_system_prompt_explains_identity_capabilities_and_config(
 
 
 @pytest.mark.asyncio
+async def test_lead_agent_has_team_tool_and_routing_guidance(
+    git_repo: Path, settings
+) -> None:
+    manager = AgentSessionManager(git_repo, settings)
+    session = manager.create("lead", llm=FakeLLMClient(scripted_responses=[]))
+    try:
+        # The lead session can autonomously delegate to specialist sub-agents.
+        assert session.agent.team is not None
+        system = session.agent._runtime_system_context()  # pyright: ignore[reportPrivateUsage]
+        assert "Delegating to specialist sub-agents" in system
+        assert "self.team.delegate" in system
+        # The team tool must be discoverable via the agent's self-doc so the
+        # model knows it can call it.
+        agent_api = doc(session.agent)
+        assert "team" in agent_api
+        # The team tool's own doc (injected as the `team_tools` context block)
+        # must expose the delegate/list_presets API to the model.
+        from nooa_coding.tools import TeamTools
+
+        team_doc = doc(TeamTools)
+        assert "delegate" in team_doc
+        assert "list_presets" in team_doc
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_sub_agent_session_has_no_team_tool(git_repo: Path, settings) -> None:
+    manager = AgentSessionManager(git_repo, settings)
+    session = manager.create(
+        "worker", llm=FakeLLMClient(scripted_responses=[]), is_sub_agent=True
+    )
+    try:
+        # Sub-agents must not get the team tool (prevents recursive spawning).
+        assert session.agent.team is None
+        system = session.agent._runtime_system_context()  # pyright: ignore[reportPrivateUsage]
+        assert "Delegating to specialist sub-agents" not in system
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
 async def test_repository_question_routes_to_read_only_inspection(git_repo: Path, settings) -> None:
     response = response_with_code(
         "return_result(InspectionDraft(status='completed', "

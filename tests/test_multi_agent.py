@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import subprocess
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -118,12 +118,14 @@ def _make_mock_manager(tmp_path: Path) -> MagicMock:
     manager = MagicMock()
     manager.repo = tmp_path
 
-    def create_session(session_id, start_ref="HEAD", parent_session_id=None):
+    def create_session(
+        session_id, start_ref="HEAD", parent_session_id=None, is_sub_agent=False
+    ):
         sub = MagicMock()
         sub.session_id = session_id
         sub.metadata.workspace.path = str(tmp_path / f"worktree-{session_id}")
         sub.metadata.workspace.branch = f"nooa-coding/{session_id}"
-        sub._is_sub_agent = False
+        sub._is_sub_agent = is_sub_agent
         sub.agent.shell._policy = MagicMock()
         return sub
 
@@ -161,6 +163,69 @@ class TestCoordinator:
         handles = coordinator.spawn(tasks)
         assert handles[0].status == TaskStatus.RUNNING
         handles[0].cancel()
+
+    @pytest.mark.asyncio
+    async def test_spawn_injects_role_into_subagent_system_context(self, tmp_path):
+        """The preset role must be injected as the sub-agent's persistent system
+        context (a true role-specific system prompt), not just task text."""
+        from nooa import Context
+
+        manager = _make_mock_manager(tmp_path)
+        parent = _make_mock_session(tmp_path)
+        coordinator = Coordinator(manager, parent)
+
+        created: list[MagicMock] = []
+        original = manager.create.side_effect
+
+        def capture(session_id, **kwargs):
+            sub = original(session_id, **kwargs)
+            created.append(sub)
+            return sub
+
+        manager.create = MagicMock(side_effect=capture)
+
+        role_text = "You are Search Scout, a code-search specialist sub-agent."
+        tasks = [TaskPackage(objective="find the handler", role=role_text)]
+        handles = coordinator.spawn(tasks)
+        try:
+            assert created, "expected a sub-session to be created"
+            ctx_manager = created[0].agent.context_manager
+            ctx_manager.__setitem__.assert_any_call("subagent_role", ANY)
+            injected = ctx_manager.__setitem__.call_args_list[-1].args[1]
+            assert isinstance(injected, Context)
+            assert injected.value == role_text
+            assert injected.prefix is True
+        finally:
+            for handle in handles:
+                handle.cancel()
+
+    @pytest.mark.asyncio
+    async def test_spawn_without_role_skips_context_injection(self, tmp_path):
+        """A task with no role must not inject a subagent_role context."""
+        manager = _make_mock_manager(tmp_path)
+        parent = _make_mock_session(tmp_path)
+        coordinator = Coordinator(manager, parent)
+
+        created: list[MagicMock] = []
+        original = manager.create.side_effect
+
+        def capture(session_id, **kwargs):
+            sub = original(session_id, **kwargs)
+            created.append(sub)
+            return sub
+
+        manager.create = MagicMock(side_effect=capture)
+
+        tasks = [TaskPackage(objective="plain task")]  # role defaults to ""
+        handles = coordinator.spawn(tasks)
+        try:
+            assert created, "expected a sub-session to be created"
+            ctx_manager = created[0].agent.context_manager
+            keys = [c.args[0] for c in ctx_manager.__setitem__.call_args_list]
+            assert "subagent_role" not in keys
+        finally:
+            for handle in handles:
+                handle.cancel()
 
     @pytest.mark.asyncio
     async def test_spawn_after_close_raises(self, tmp_path):

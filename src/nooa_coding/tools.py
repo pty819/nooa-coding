@@ -256,4 +256,65 @@ class LSPTools(Skill):
         return line[start:end]
 
 
-__all__ = ["CodeSearch", "LSPTools"]
+class TeamTools(Skill):
+    """Delegate independent sub-tasks to isolated specialist sub-agents."""
+
+    __nosnapshot__ = True
+
+    def __init__(self, delegator: object) -> None:
+        self._delegator = delegator
+        super().__init__()
+
+    def list_presets(self) -> str:
+        """List available specialist sub-agents and what each is for."""
+        from .presets import PRESET_AGENTS
+
+        lines = []
+        for name, preset in PRESET_AGENTS.items():
+            mode = "read-only" if preset.read_only else "can modify files"
+            lines.append(f"- {name} ({preset.title}, {mode}): {preset.description}")
+        return "\n".join(lines)
+
+    async def delegate(
+        self,
+        preset: Annotated[
+            str,
+            spec(description="Preset name: search/explore/architect/test/executor/pm"),
+        ],
+        objective: Annotated[
+            str, spec(description="Self-contained task description for the sub-agent")
+        ],
+        *,
+        context: Annotated[
+            str,
+            spec(description="Key background facts the sub-agent needs (it has no shared memory)"),
+        ] = "",
+    ) -> str:
+        """Run one specialist sub-agent in an isolated worktree and return its report.
+
+        The sub-agent starts with a clean context window. Read-only presets cannot
+        modify files; writable presets' committed work is merged back automatically.
+        Use list_presets() to see the available specialists.
+        """
+        from .presets import get_preset
+
+        try:
+            info = get_preset(preset)
+        except KeyError as exc:
+            return str(exc)
+        report = await self._delegator.delegate_preset(  # noqa: SLF001
+            preset, objective, context_summary=context or None
+        )
+        lines = [f"[{info.title}] status={report.status}"]
+        if report.summary:
+            lines.append(report.summary.strip())
+        if report.files_changed:
+            lines.append("Files changed: " + ", ".join(report.files_changed))
+        if report.commits:
+            lines.append("Commits: " + ", ".join(commit[:8] for commit in report.commits))
+        if report.error:
+            lines.append(f"Error: {report.error}")
+        return "\n".join(lines)
+
+
+__all__ = ["CodeSearch", "LSPTools", "TeamTools"]

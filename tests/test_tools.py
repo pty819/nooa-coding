@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from nooa_coding.tools import CodeSearch, LSPTools
+from nooa_coding.multi_agent import TaskStatus, WorkerReport
+from nooa_coding.tools import CodeSearch, LSPTools, TeamTools
 
 
 @pytest.fixture
@@ -169,3 +170,60 @@ class TestWorktreeContainment:
         cs = CodeSearch(code_root)
         result = await cs.read_range("src/main.py", 1, 2)
         assert "hello" in result
+
+
+class _FakeDelegator:
+    """Records delegate_preset calls and returns a canned report."""
+
+    def __init__(self, report: WorkerReport) -> None:
+        self._report = report
+        self.calls: list[tuple[str, str, str | None]] = []
+
+    async def delegate_preset(
+        self, preset_name, objective, *, context_summary=None, on_progress=None
+    ):
+        self.calls.append((preset_name, objective, context_summary))
+        return self._report
+
+
+class TestTeamTools:
+    def test_list_presets_lists_all_specialists(self):
+        team = TeamTools(object())
+        listing = team.list_presets()
+        for name in ("search", "explore", "architect", "test", "executor", "pm"):
+            assert name in listing
+
+    @pytest.mark.asyncio
+    async def test_delegate_invokes_delegator_and_formats_report(self):
+        report = WorkerReport(
+            task_id="t1",
+            status=TaskStatus.COMPLETED,
+            summary="found the auth handler",
+            files_changed=["src/auth.py"],
+            commits=["abcdef1234567890"],
+        )
+        delegator = _FakeDelegator(report)
+        team = TeamTools(delegator)
+
+        out = await team.delegate("search", "locate auth", context="uses JWT")
+
+        assert delegator.calls == [("search", "locate auth", "uses JWT")]
+        assert "Search Scout" in out
+        assert "found the auth handler" in out
+        assert "src/auth.py" in out
+        assert "abcdef12" in out
+
+    @pytest.mark.asyncio
+    async def test_delegate_defaults_context_to_none(self):
+        delegator = _FakeDelegator(
+            WorkerReport(task_id="t2", status=TaskStatus.COMPLETED, summary="ok")
+        )
+        team = TeamTools(delegator)
+        await team.delegate("explore", "map the module")
+        assert delegator.calls == [("explore", "map the module", None)]
+
+    @pytest.mark.asyncio
+    async def test_delegate_unknown_preset_returns_error_string(self):
+        team = TeamTools(object())
+        out = await team.delegate("does-not-exist", "x")
+        assert "unknown sub-agent preset" in out

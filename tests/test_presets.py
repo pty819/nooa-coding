@@ -10,6 +10,7 @@ from nooa_coding.presets import (
     SubAgentPreset,
     build_preset_task,
     get_preset,
+    render_routing_guidance,
 )
 
 EXPECTED_PRESETS = {"search", "explore", "architect", "test", "executor", "pm"}
@@ -81,3 +82,26 @@ def test_build_preset_task_budget_overrides() -> None:
     assert task.timeout_seconds == 42
     assert task.token_budget == 1234
     assert task.read_only is False
+
+
+def test_role_prompts_are_business_goal_system_prompts() -> None:
+    """Each preset must carry a true role-specific system prompt grounded in a
+    concrete business goal, methodology, and output contract — not a label."""
+    for name, preset in PRESET_AGENTS.items():
+        assert "You are" in preset.role_prompt, name
+        assert "Business goal" in preset.role_prompt, name
+        assert "Methodology" in preset.role_prompt, name
+        assert "Output contract" in preset.role_prompt, name
+
+
+def test_routing_guidance_lists_all_presets() -> None:
+    guidance = render_routing_guidance()
+    for name in EXPECTED_PRESETS:
+        assert f"`{name}`" in guidance, name
+
+
+def test_routing_guidance_documents_delegate_api_and_triggers() -> None:
+    guidance = render_routing_guidance()
+    assert "self.team.delegate" in guidance
+    assert "Trigger guidance" in guidance
+    assert "list_presets" in guidance

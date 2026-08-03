@@ -24,7 +24,7 @@ from .mcp import MCPRuntime
 from .plugin import PluginRegistry
 from .policy import ApprovalManager, PolicyShellTools
 from .resources import install_resources, load_agents_context
-from .tools import CodeSearch, LSPTools
+from .tools import CodeSearch, LSPTools, TeamTools
 
 with hidden:
     import ast
@@ -160,6 +160,7 @@ class CodingAgent(MemoryToolsMixin, InteractiveAgent):
     skills: Annotated[SkillRegistry, nosnapshot]
     search: Annotated[CodeSearch, nosnapshot]
     lsp: Annotated[LSPTools, nosnapshot]
+    team: Annotated[Any, nosnapshot]
     task: str = ""
     last_result: CodingTaskResult | None = None
     _repo_root: Annotated[Path, hidden, nosnapshot]
@@ -179,6 +180,8 @@ class CodingAgent(MemoryToolsMixin, InteractiveAgent):
         event_sink: Any,
         *,
         storage: StorageManager | None = None,
+        is_sub_agent: bool = False,
+        delegator: Any = None,
     ) -> None:
         super().__init__(llm=llm, storage=storage)  # pyright: ignore[reportCallIssue]
         self._repo_root = Path(repo).expanduser().resolve()
@@ -190,6 +193,10 @@ class CodingAgent(MemoryToolsMixin, InteractiveAgent):
         self.skills = install_resources(self, self._repo_root, settings.resources)
         self.search = CodeSearch(self._repo_root)
         self.lsp = LSPTools(self._repo_root)
+        # Only the lead (non-sub-agent) session gets a team tool so it can
+        # autonomously delegate to specialist sub-agents. Sub-agents never get
+        # this tool, which (with the coordinator guard) prevents recursive spawning.
+        self.team = TeamTools(delegator) if (not is_sub_agent and delegator is not None) else None
         self._mcp = MCPRuntime(
             self._repo_root,
             settings.mcp,
@@ -204,6 +211,8 @@ class CodingAgent(MemoryToolsMixin, InteractiveAgent):
         self.context_manager["coding_tools"] = Context(
             doc(PolicyShellTools, RepoTools, TodoManager), prefix=True
         )
+        if self.team is not None:
+            self.context_manager["team_tools"] = Context(doc(TeamTools), prefix=True)
         self.context_manager.set_dynamic("task", "self.task")
         self.context_manager.set_dynamic("todo_status", "self.todo.status()")
         spec(self, "context", hidden=False)
@@ -295,10 +304,15 @@ class CodingAgent(MemoryToolsMixin, InteractiveAgent):
         return str(getattr(active, "model", getattr(self.llm, "model", "unknown")))
 
     def _runtime_system_context(self) -> str:
-        return render_runtime_system_context(
+        base = render_runtime_system_context(
             active_model=self._current_model(),
             worktree=self._repo_root,
         )
+        if getattr(self, "team", None) is not None:
+            from .presets import render_routing_guidance
+
+            base = f"{base}\n{render_routing_guidance()}"
+        return base
 
     def _local_answer(self, task: str) -> str | None:
         normalized = " ".join(task.lower().split())

@@ -258,10 +258,20 @@ class Coordinator:
             session_id,
             start_ref=task.base_commit,
             parent_session_id=self._parent.session_id,
+            is_sub_agent=True,
         )
 
         # Mark as sub-agent (prevents spawning further sub-agents).
         sub_session._is_sub_agent = True  # noqa: SLF001
+
+        # Inject the preset's role as the sub-agent's persistent system context so
+        # it acts as a true role-specific system prompt, not just task text.
+        if task.role:
+            from nooa import Context
+
+            sub_session.agent.context_manager["subagent_role"] = Context(
+                task.role, prefix=True
+            )
 
         # Apply restricted permissions.
         self._apply_restrictions(sub_session, task)

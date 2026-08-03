@@ -88,6 +88,7 @@ class AgentSession:
         *,
         llm: UnifiedLLM | None = None,
         restore: bool = False,
+        is_sub_agent: bool = False,
     ) -> None:
         self.manager = manager
         self.metadata = metadata
@@ -108,7 +109,7 @@ class AgentSession:
         self._resolved_context_window: int | None = None
         self._goal: GoalState | None = None
         self._coordinator: Coordinator | None = None
-        self._is_sub_agent = False
+        self._is_sub_agent = is_sub_agent
         self._lesson_store: LessonStore | None = None
         self._lesson_extractor: LessonExtractor | None = None
 
@@ -141,6 +142,8 @@ class AgentSession:
             approvals=self.approvals,
             event_sink=self._tool_event,
             storage=self.storage,
+            is_sub_agent=is_sub_agent,
+            delegator=None if is_sub_agent else self,
         )
         self.agent.event_manager.register_event_type(AgentMessage)
         self._unsubscribe = self.agent.event_manager.on("*", self._on_nooa_event)
@@ -399,7 +402,7 @@ class AgentSession:
         return reports
 
     async def delegate_preset(
-        self, preset_name: str, objective: str, *, on_progress: Any = None
+        self, preset_name: str, objective: str, *, context_summary: str | None = None, on_progress: Any = None
     ) -> WorkerReport:
         """Run a single preset sub-agent and merge its work if it produced commits.
 
@@ -409,10 +412,11 @@ class AgentSession:
         from .presets import build_preset_task, get_preset
 
         preset = get_preset(preset_name)
+        summary = context_summary or f"Delegated by session {self.session_id}"
         task = build_preset_task(
             preset,
             objective,
-            context_summary=f"Delegated by session {self.session_id}",
+            context_summary=summary,
             base_commit="HEAD",
             timeout_seconds=self.settings.subagent.timeout_seconds,
             token_budget=self.settings.subagent.token_budget,
@@ -1022,6 +1026,7 @@ class AgentSessionManager:
         *,
         start_ref: str = "HEAD",
         parent_session_id: str | None = None,
+        is_sub_agent: bool = False,
         llm: UnifiedLLM | None = None,
     ) -> AgentSession:
         value = self.validate_session_id(session_id or self.generate_session_id())
@@ -1041,6 +1046,7 @@ class AgentSessionManager:
                 metadata,
                 self._normalized_settings(),
                 llm=llm,
+                is_sub_agent=is_sub_agent,
             )
             session._emit("session", "session_created", {"workspace": workspace.model_dump()})
             session.checkpoint("initial")
