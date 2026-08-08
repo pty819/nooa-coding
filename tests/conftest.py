@@ -69,7 +69,12 @@ def response_with_code(code: str) -> LLMResponse:
     )
 
 
-def coding_response(*, write_file: bool = True, status: str = "completed") -> LLMResponse:
+def coding_response(
+    *,
+    write_file: bool = True,
+    status: str = "completed",
+    verification: str = 'python3 -c "print(1)"',
+) -> LLMResponse:
     write = "await self.shell.write_file('result.txt', 'done\\n')\n" if write_file else ""
     code = f"""{write}return_result(CodingTaskDraft(
     status={status!r},
@@ -77,7 +82,7 @@ def coding_response(*, write_file: bool = True, status: str = "completed") -> LL
     root_cause='missing fixture output',
     changed_files=['result.txt'] if {write_file!r} else [],
     evidence='observed scripted tool output',
-    suggested_verification='python3 -c \\\"print(1)\\\"',
+    suggested_verification={verification!r},
 ))"""
     return response_with_code(code)
 

@@ -17,7 +17,7 @@ from nooa.strategies import PredictStrategy
 from nooa.tools.todo import TodoManager
 from nooa_cli.tools.repo_tools import RepoTools
 from nooa_memory import MemoryManager, MemoryToolsMixin
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from .config import CodingSettings
 from .mcp import MCPRuntime
@@ -29,6 +29,7 @@ from .tools import CodeSearch, LSPTools, TeamTools
 with hidden:
     import ast
     import hashlib
+    import json
 
     from .system_prompt import render_runtime_system_context
 
@@ -43,7 +44,33 @@ class CodingTaskDraft(BaseModel):
     root_cause: str = "not applicable"
     changed_files: list[str] = Field(default_factory=list)
     evidence: str
-    suggested_verification: str = ""
+    suggested_verification: str = Field(
+        default="",
+        description=(
+            "Exactly one executable shell command that verifies this change, e.g. "
+            "`uv run pytest tests/test_foo.py`. No prose, no markdown, no newlines; "
+            "the host executes this string verbatim in a shell."
+        ),
+    )
+
+
+def _looks_like_shell_command(text: str) -> bool:
+    """Deterministic gate rejecting prose before it reaches the shell."""
+    if not text or "\n" in text or "`" in text:
+        return False
+    if text[-1] in ".!?。！？":
+        return False
+    if any(
+        "\u3000" <= char <= "\u303f"
+        or "\u3040" <= char <= "\u30ff"
+        or "\u4e00" <= char <= "\u9fff"
+        or "\uf900" <= char <= "\ufaff"
+        or "\uff00" <= char <= "\uffef"
+        for char in text
+    ):
+        return False
+    head = text.split(maxsplit=1)[0]
+    return head[0].isalnum() or head[0] in ".-/" or head.startswith("$")
 
 
 class InspectionDraft(BaseModel):
@@ -51,6 +78,24 @@ class InspectionDraft(BaseModel):
     summary: str
     evidence: str
     root_cause: str = "not applicable"
+
+
+class HistorySummary(BaseModel):
+    """Compaction summary tolerant of models that emit JSON instead of prose."""
+
+    value: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_structured_output(cls, data: Any) -> dict[str, Any]:
+        if isinstance(data, str):
+            return {"value": data}
+        if isinstance(data, dict):
+            value = data.get("value")
+            if isinstance(value, str) and value.strip():
+                return {"value": value}
+            return {"value": json.dumps(data, ensure_ascii=False, indent=2)}
+        return {"value": str(data)}
 
 
 class ConversationDraft(BaseModel):
@@ -554,7 +599,15 @@ class CodingAgent(MemoryToolsMixin, InteractiveAgent):
             suggested = draft.suggested_verification.strip()
             commands = ["git diff --check", *configured]
             if not configured and suggested:
-                commands.append(suggested)
+                if _looks_like_shell_command(suggested):
+                    commands.append(suggested)
+                else:
+                    status = "verification_failed"
+                    draft.evidence += (
+                        "\nThe suggested verification is not an executable shell "
+                        "command and was rejected by the host. Configure "
+                        "verification_commands in settings instead."
+                    )
             if not configured and not suggested:
                 status = "verification_failed"
                 draft.evidence += (
@@ -636,12 +689,26 @@ class CodingAgent(MemoryToolsMixin, InteractiveAgent):
             return None
         old_tags = tags[:-keep]
         rendered = "\n\n".join(f"[{tag}] {self.events[tag]}" for tag in old_tags)
-        summary = await self._summarize_history(rendered)
-        return self.events.collapse(old_tags[0], old_tags[-1], summary)
+        try:
+            text = (await self._summarize_history(rendered)).value.strip()
+        except Exception:
+            text = ""
+        if not text:
+            # Deterministic fallback: never let compaction fail outright.
+            cap = self._settings.compaction.target_chars
+            text = (
+                "[compaction fallback: model summary unavailable; kept truncated "
+                f"raw history]\n{rendered[:cap]}"
+            )
+        return self.events.collapse(old_tags[0], old_tags[-1], text)
 
     @strategy(PredictStrategy(config=PredictConfig(max_param_chars=200_000)))
-    async def _summarize_history(self, history: str) -> str:
-        """Preserve decisions, evidence, modifications, open work, and identifiers from history."""
+    async def _summarize_history(self, history: str) -> HistorySummary:
+        """Preserve decisions, evidence, modifications, open work, and identifiers from history.
+
+        Put the entire summary as plain prose text in the `value` field; do not
+        wrap it in nested JSON objects.
+        """
         ...
 
     @strategy(PredictStrategy(config=PredictConfig(max_param_chars=20_000)))
@@ -688,6 +755,7 @@ __all__ = [
     "CodingTaskDraft",
     "CodingTaskResult",
     "ConversationDraft",
+    "HistorySummary",
     "InspectionDraft",
     "RequestRoute",
     "VerificationResult",

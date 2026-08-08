@@ -12,6 +12,7 @@ from nooa.agentdoc import doc
 from nooa.events import Message, Summary
 from nooa.unifiedllm import FakeLLMClient, LLMResponse
 
+from nooa_coding.agent import HistorySummary, _looks_like_shell_command
 from nooa_coding.config import CompactionSettings, PermissionSettings
 from nooa_coding.events import TokenUsage
 from nooa_coding.session import AgentSessionManager
@@ -170,6 +171,36 @@ async def test_change_completion_requires_a_new_host_observed_change(
         await session.close()
 
 
+def test_shell_command_gate_rejects_prose() -> None:
+    assert _looks_like_shell_command("uv run pytest tests/")
+    assert _looks_like_shell_command("python3 -c 'print(\"verified\")'")
+    assert _looks_like_shell_command("./.venv/bin/python bs_iv.py")
+    assert not _looks_like_shell_command("")
+    assert not _looks_like_shell_command("\n".join(["echo a", "echo b"]))
+    assert not _looks_like_shell_command("运行 `.venv/bin/python bs_iv.py` 验证自测输出。")
+    assert not _looks_like_shell_command("Run the self test and inspect the output.")
+
+
+@pytest.mark.asyncio
+async def test_natural_language_suggested_verification_is_rejected(
+    git_repo: Path, settings
+) -> None:
+    no_verification = settings.model_copy(update={"verification_commands": ()})
+    manager = AgentSessionManager(git_repo, no_verification)
+    prose = "运行 `.venv/bin/python bs_iv.py` 验证自测输出。可进一步用 import bs_iv 测试自定义参数。"
+    session = manager.create(
+        "prose-rejected", llm=fake_llm(coding_response(verification=prose))
+    )
+    try:
+        result = await session.prompt("implement the requested change")
+        assert result.status == "verification_failed"
+        assert "not an executable shell command" in result.evidence
+        assert [v.command for v in result.verifications] == ["git diff --check"]
+        assert all(prose not in v.command for v in result.verifications)
+    finally:
+        await session.close()
+
+
 @pytest.mark.asyncio
 async def test_session_approval_and_cancel(git_repo: Path, settings) -> None:
     asking = settings.model_copy(
@@ -229,6 +260,48 @@ async def test_explicit_compaction_collapses_old_events(git_repo: Path, settings
     assert isinstance(summary, Summary)
     assert summary.summary_text is not None
     assert "Preserved decisions" in summary.summary_text
+    await session.close()
+
+
+def test_history_summary_coerces_structured_model_output() -> None:
+    assert HistorySummary.model_validate("plain prose").value == "plain prose"
+    assert HistorySummary.model_validate({"value": "kept"}).value == "kept"
+    coerced = HistorySummary.model_validate(
+        {"summary": "Session covered the bs_iv solver", "refs": "bs_iv.py:163"}
+    )
+    assert "Session covered the bs_iv solver" in coerced.value
+    assert "bs_iv.py:163" in coerced.value
+    assert HistorySummary.model_validate({"value": {"nested": True}}).value.startswith("{")
+
+
+@pytest.mark.asyncio
+async def test_compact_accepts_dict_summary_from_model(git_repo: Path, settings) -> None:
+    # glm-5.2-style output: a structured object instead of the requested prose.
+    dict_response = LLMResponse(
+        raw_response=None,
+        content=json.dumps(
+            {"summary": "Session covered the bs_iv solver", "refs": {"open": "bs_iv.py:163"}}
+        ),
+        tool_calls=[],
+        finish_reason="stop",
+        assistant_message={"role": "assistant", "content": "summary"},
+    )
+    compacting = settings.model_copy(
+        update={"compaction": CompactionSettings(enabled=False, preserve_recent=1)}
+    )
+    manager = AgentSessionManager(git_repo, compacting)
+    session = manager.create("compact-dict", llm=fake_llm(dict_response))
+    session.agent.event_manager.add(Message(content="first investigation"))
+    session.agent.event_manager.add(Message(content="second investigation"))
+    session.agent.event_manager.add(Message(content="recent state"))
+
+    tag = await session.compact(preserve_recent=1)
+
+    assert tag is not None
+    summary = session.agent.events[tag]
+    assert isinstance(summary, Summary)
+    assert summary.summary_text is not None
+    assert "Session covered the bs_iv solver" in summary.summary_text
     await session.close()
 
 
