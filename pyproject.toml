@@ -30,6 +30,7 @@ dev = [
     "pyright>=1.1.408",
     "pytest>=8.0",
     "pytest-asyncio>=0.25",
+    "python-semantic-release>=9.0",
     "ruff>=0.14",
 ]
 
@@ -57,3 +58,20 @@ ignore = ["E501"]
 pythonVersion = "3.12"
 typeCheckingMode = "standard"
 include = ["src", "tests"]
+
+# Automated versioning: versions are derived from Conventional Commits
+# (feat -> minor, fix -> patch, BREAKING CHANGE -> major). Run
+# `uv run semantic-release version` to bump pyproject.toml, update
+# CHANGELOG.md, and tag the release. Publishing stays manual.
+[tool.semantic_release]
+version_toml = ["pyproject.toml:project.version"]
+# 0.x development phase: stay below 1.0 until a breaking change is
+# intentionally promoted; breaking changes on 0.x bump the minor digit.
+allow_zero_version = true
+major_on_zero = false
+build_command = ""
+tag_format = "v{version}"
+commit_author = "NOOA Release Bot <nooa-coding@localhost>"
+
+[tool.semantic_release.publish]
+upload_to_vcs_release = false

@@ -133,3 +133,18 @@ No code in this repository should require modifications to a NOOA checkout.
 Some internal NOOA attributes (e.g. `_policy`, `_mcp`) are accessed for
 host-level orchestration; these are treated as stable integration points
 rather than public API.
+
+## Versioning and releases
+
+Versions are automated with `python-semantic-release` and derived from
+Conventional Commits since the last release tag: `fix:` bumps the patch
+digit, `feat:` bumps the minor digit, and breaking changes bump the minor
+digit while the project stays in `0.x`. To cut a release after merging
+work:
+
+```bash
+uv run semantic-release version    # bumps pyproject.toml, updates CHANGELOG.md, tags vX.Y.Z
+```
+
+Preview without changing anything with `uv run semantic-release version
+--print`. Publishing is manual; releases never push artifacts automatically.

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import tomllib
 from pathlib import Path
 
@@ -37,3 +38,22 @@ def test_mcp_client_extra_is_enabled_with_compatible_protocol_version() -> None:
 
     assert any(d.startswith("nooa[mcp]") for d in dependencies)
     assert "mcp>=1,<2" in dependencies
+
+
+def test_semantic_release_automates_versioning_from_commits() -> None:
+    """Version bumps stay automated: PSR config targets pyproject and stays local."""
+    root = Path(__file__).parents[1]
+    config = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+
+    assert re.fullmatch(r"\d+\.\d+\.\d+", config["project"]["version"])
+
+    dev = config["dependency-groups"]["dev"]
+    assert any(dep.startswith("python-semantic-release") for dep in dev)
+
+    sr = config["tool"]["semantic_release"]
+    assert sr["version_toml"] == ["pyproject.toml:project.version"]
+    assert sr["allow_zero_version"] is True
+    assert sr["major_on_zero"] is False
+    assert sr["tag_format"] == "v{version}"
+    # Publishing remains manual; releases only produce a version bump + tag.
+    assert sr["publish"]["upload_to_vcs_release"] is False
